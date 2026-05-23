@@ -693,6 +693,13 @@ impl SearchPaths {
         }
     }
 
+    /// Returns `true` if at least one `site-packages` search path is
+    /// configured. Used as a heuristic to decide whether building the
+    /// root-component index pays off.
+    pub(crate) fn has_site_packages(&self) -> bool {
+        !self.site_packages.is_empty()
+    }
+
     /// Registers the file roots for all non-dynamically discovered search paths that aren't first-party.
     pub fn try_register_static_roots(&self, db: &dyn Db) {
         let files = db.files();
@@ -1067,18 +1074,21 @@ struct ModuleNameIngredient<'db> {
 /// Given a module name and a list of search paths in which to lookup modules,
 /// attempt to resolve the module name.
 ///
-/// Narrows the candidate search paths using
-/// [`search_paths_for_root_component`]: only search paths whose root
-/// directory plausibly contains an entry for the module's first component
-/// are considered. For projects with many search paths this turns most
-/// resolutions into a single hash lookup against an index instead of a
-/// probe in every search path.
+/// When site-packages are configured, narrows the candidate search paths via
+/// [`search_paths_for_root_component`] so most resolutions hit a single
+/// index lookup instead of probing every search path. For configurations
+/// without site-packages there are typically only a handful of search paths,
+/// so the index isn't worth its upfront cost — fall back to the direct
+/// iteration in that case.
 fn resolve_name(db: &dyn Db, name: &ModuleName, mode: ModuleResolveMode) -> Option<ResolvedNames> {
-    let candidates = search_paths_for_root_component(db, name.first_component(), mode);
-    if candidates.is_empty() {
-        return None;
+    if db.search_paths().has_site_packages() {
+        let candidates = search_paths_for_root_component(db, name.first_component(), mode);
+        if candidates.is_empty() {
+            return None;
+        }
+        return resolve_name_impl(db, name, mode, candidates.iter());
     }
-    resolve_name_impl(db, name, mode, candidates.iter())
+    resolve_name_impl(db, name, mode, search_paths(db, mode))
 }
 
 /// Like `resolve_name` but for cases where it failed to resolve the module
@@ -2417,17 +2427,10 @@ mod tests {
             )
         });
 
-        // The root-component index is keyed on the search path's set of
-        // entry names, so deleting `bar.py` mutates the index (removes the
-        // `bar` entry) and forces `root_component_index` to re-execute. But
-        // the entry for the `foo` component is unchanged, so salsa backdates
-        // the higher-level `resolve_module_query` for `foo`.
-        let events = db.take_salsa_events();
-        assert_function_query_was_not_run(
-            &db,
-            resolve_module_query,
-            ModuleNameIngredient::new(&db, foo_module_name, ModuleResolveMode::StubsAllowed),
-            &events,
+        assert!(
+            !db.take_salsa_events()
+                .iter()
+                .any(|event| { matches!(event.kind, salsa::EventKind::WillExecute { .. }) })
         );
 
         assert_eq!(Some(foo_pieces), foo_pieces2);
@@ -2483,7 +2486,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_file_to_search_path_with_lower_priority_still_resolves_to_higher_priority() {
+    fn adding_file_to_search_path_with_lower_priority_does_not_invalidate_query() {
         const TYPESHED: MockedTypeshed = MockedTypeshed {
             versions: "functools: 3.8-",
             stdlib_files: &[("functools.pyi", "def update_wrapper(): ...")],
@@ -2509,16 +2512,22 @@ mod tests {
             system_path_to_file(&db, &stdlib_functools_path)
         );
 
-        // Adding a file to site-packages causes the root-component index's
-        // entry for `functools` to gain a candidate, so `resolve_module_query`
-        // re-executes. Stdlib still wins on priority — the final result is
-        // unchanged.
+        // Adding a file to site-packages does not invalidate the query,
+        // since site-packages takes lower priority in the module resolution
+        db.clear_salsa_events();
         let site_packages_functools_path = site_packages.join("functools.py");
         db.write_file(&site_packages_functools_path, "f: int")
             .unwrap();
         let functools_module = resolve_module_confident(&db, &functools_module_name).unwrap();
         let functools_file = functools_module.file(&db).unwrap();
         let functools_search_path = functools_module.search_path(&db).unwrap().clone();
+        let events = db.take_salsa_events();
+        assert_function_query_was_not_run(
+            &db,
+            resolve_module_query,
+            ModuleNameIngredient::new(&db, functools_module_name, ModuleResolveMode::StubsAllowed),
+            &events,
+        );
         assert_eq!(&functools_search_path, &stdlib);
         assert_eq!(
             Ok(functools_file),

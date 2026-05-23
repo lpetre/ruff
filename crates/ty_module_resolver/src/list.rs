@@ -4,6 +4,7 @@ use camino::Utf8Path;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use ruff_python_ast::PythonVersion;
+use ruff_python_stdlib::identifiers::is_identifier;
 
 use crate::db::Db;
 use crate::module::{Module, ModuleKind};
@@ -133,21 +134,42 @@ fn root_component_index<'db>(
 /// Components that an entry at the root of a search path could yield as a
 /// top-level module — `foo/`, `foo-stubs/`, `foo.py`, `foo.pyi`. Generous on
 /// purpose: false positives are fine (the resolver re-checks each candidate)
-/// but false negatives are not.
+/// but false negatives are not. Names that aren't valid Python identifiers
+/// can never be resolved as components, so they're filtered out.
 fn components_provided_by(entries: &FxHashMap<Box<str>, FileType>) -> FxHashSet<Box<str>> {
     let mut out = FxHashSet::default();
     for (name, file_type) in entries {
         let path = Utf8Path::new(name.as_ref());
-        if matches!(file_type, FileType::Directory | FileType::Symlink) {
-            out.insert(name.clone());
-            if let Some(stripped) = name.strip_suffix("-stubs") {
+        let is_python_file = path.extension().is_some_and(is_python_extension);
+
+        // Directory candidates: real directories, plus symlinks that don't
+        // *look* like Python files (those are handled by the file branch
+        // below). A symlink to a directory keeps directory semantics; a
+        // symlink whose name ends in `.py(i)` is treated as a file.
+        let is_directory_like = matches!(file_type, FileType::Directory)
+            || (matches!(file_type, FileType::Symlink) && !is_python_file);
+        if is_directory_like {
+            if is_identifier(name) {
+                out.insert(name.clone());
+            }
+            if let Some(stripped) = name.strip_suffix("-stubs")
+                && is_identifier(stripped)
+            {
                 out.insert(Box::from(stripped));
             }
         }
-        if matches!(path.extension(), Some("py" | "pyi"))
-            && let Some(stem) = path.file_stem()
+
+        // File candidates: regular files with a Python extension, plus
+        // symlinks whose name ends in `.py(i)`.
+        if matches!(file_type, FileType::File)
+            || (matches!(file_type, FileType::Symlink) && is_python_file)
         {
-            out.insert(Box::from(stem));
+            if is_python_file
+                && let Some(stem) = path.file_stem()
+                && is_identifier(stem)
+            {
+                out.insert(Box::from(stem));
+            }
         }
     }
     out
