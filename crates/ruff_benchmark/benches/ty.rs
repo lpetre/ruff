@@ -1563,6 +1563,66 @@ fn benchmark_resolve_present_module_search_paths(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// A representative handful of module names that an application typically
+/// imports. They're stdlib modules, so they all resolve to the vendored
+/// typeshed — but the resolver still has to consider every search path on
+/// the first iteration for each name before reaching the stdlib search path.
+static STATIC_MODULE_NAMES: &[&str] = &[
+    "os",
+    "sys",
+    "json",
+    "typing",
+    "collections",
+    "pathlib",
+    "re",
+    "datetime",
+    "asyncio",
+    "logging",
+    "tempfile",
+    "subprocess",
+    "argparse",
+    "functools",
+    "itertools",
+    "warnings",
+];
+
+/// Benchmarks module resolution with a fixed, realistic pool of module names
+/// being resolved across an increasing number of configured search paths.
+///
+/// Each iteration uses a *fresh* `ProjectDatabase` so all salsa caches start
+/// cold. Within a single iteration the search-path listings get computed once
+/// per search path, then the same handful of module names are resolved
+/// against them. This mirrors a session that opens a project and checks a
+/// file whose imports are common stdlib names — a much more representative
+/// workload than the parameterized "all module names are unique" variant.
+fn benchmark_resolve_static_modules_search_paths(criterion: &mut Criterion) {
+    setup_rayon();
+
+    let mut group = criterion.benchmark_group("ty_micro/resolve_static_modules_search_paths");
+    for &num_search_paths in &[0usize, 1, 5, 25, 125, 600] {
+        group.throughput(criterion::Throughput::Elements(
+            STATIC_MODULE_NAMES.len() as u64,
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_search_paths),
+            &num_search_paths,
+            |b, &num_search_paths| {
+                b.iter_batched(
+                    || setup_resolve_search_paths_case(num_search_paths),
+                    |case| {
+                        for name_str in STATIC_MODULE_NAMES {
+                            let name = ModuleName::new(name_str).unwrap();
+                            let _ = resolve_module(&case.db, case.file, &name);
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(check_file, benchmark_cold, benchmark_incremental);
 criterion_group!(
     micro,
@@ -1589,6 +1649,7 @@ criterion_group!(
     benchmark_pandas_tdd,
     benchmark_resolve_missing_module_search_paths,
     benchmark_resolve_present_module_search_paths,
+    benchmark_resolve_static_modules_search_paths,
 );
 criterion_group!(project, anyio, attrs, hydra, datetype);
 criterion_main!(check_file, micro, project);
