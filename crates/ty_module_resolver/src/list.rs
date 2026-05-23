@@ -82,7 +82,7 @@ fn list_modules_in<'db>(
     tracing::debug!("Listing modules in search path '{}'", search_path.path(db));
     let mut lister = Lister::new(db, search_path.path(db));
     for entry in top_level_entries_in(db, search_path) {
-        lister.add_entry(&entry.name, entry.file_type);
+        lister.add_entry(entry);
     }
     lister.into_modules()
 }
@@ -181,16 +181,17 @@ pub(crate) fn root_to_search_paths<'db>(
     let mut map: FxHashMap<String, Vec<SearchPath>> = FxHashMap::default();
     for search_path in search_paths(db, mode.mode(db)) {
         let ingredient = SearchPathIngredient::new(db, search_path.clone());
-        let mut seen_for_path: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
         for entry in top_level_entries_in(db, ingredient) {
             let Some(root) = entry_to_root_component(entry) else {
                 continue;
             };
-            // A single search path might contain both `foo.py` and `foo/` (or
-            // `foo-stubs/`); we only need to record the search path once per
-            // key so the resolver doesn't see it twice.
-            if seen_for_path.insert(root.clone()) {
-                map.entry(root).or_default().push(search_path.clone());
+            // A single search path may contain both `foo.py` and `foo/` (or
+            // `foo-stubs/`). While we're iterating one search path, every
+            // push goes to that same search path, so any bucket whose last
+            // element is the current search path already has it.
+            let bucket = map.entry(root).or_default();
+            if bucket.last() != Some(search_path) {
+                bucket.push(search_path.clone());
             }
         }
     }
@@ -225,8 +226,7 @@ fn entry_to_root_component(entry: &TopLevelEntry) -> Option<String> {
         return None;
     }
 
-    // `__init__` at the top level of a search path doesn't form a top-level
-    // module name; skip it to keep the index clean.
+    // `__init__` is never a top-level module name.
     if stem == "__init__" {
         return None;
     }
@@ -278,15 +278,14 @@ impl<'db> Lister<'db> {
     }
 
     /// Add the given directory entry as a possible module to this lister.
-    /// `name` is the basename of the entry and `file_type` is its type
-    /// (file, directory or symlink).
     ///
     /// This may decide that the given entry does not correspond to a valid
     /// Python module. In which case, it is dropped and this is a no-op.
     ///
     /// Callers must ensure that the entry came from the same `SearchPath`
     /// used to create this `Lister`.
-    fn add_entry(&mut self, name: &str, file_type: FileType) {
+    fn add_entry(&mut self, entry: &TopLevelEntry) {
+        let TopLevelEntry { name, file_type } = entry;
         let mut has_py_extension = false;
         // We must have no extension, a Python source file extension (`.py`)
         // or a Python stub file extension (`.pyi`).
