@@ -46,6 +46,7 @@ use ruff_python_ast::{
 };
 
 use crate::db::Db;
+use crate::list::search_path_could_contain_component;
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
@@ -1233,6 +1234,34 @@ fn resolve_name_impl<'a>(
             let stubs_allowed = is_root
                 && context.mode.stubs_allowed()
                 && !candidate.path.search_path().is_standard_library();
+
+            // On the root iteration, consult the cached directory listing of
+            // the search path to skip search paths that obviously can't
+            // contain a top-level entry matching this component. This avoids
+            // a handful of filesystem probes per search path per module
+            // resolution and scales well when many search paths are
+            // configured.
+            //
+            // We only do this on the root iteration because for non-root
+            // components we've already drilled into a specific `ModulePath`
+            // and the candidate set is typically small.
+            //
+            // The check goes through a per-(search_path, component) tracked
+            // boolean query so that unrelated changes to the listing (e.g.
+            // adding or deleting a sibling file) don't invalidate this
+            // resolution's cache: only changes that flip this specific
+            // component's answer cause downstream re-execution.
+            if is_root
+                && !search_path_could_contain_component(
+                    db,
+                    candidate.path.search_path(),
+                    component,
+                    stubs_allowed,
+                )
+            {
+                continue;
+            }
+
             if stubs_allowed {
                 let stub_name = stub_name.get_or_insert_with(|| format!("{component}-stubs"));
                 let mut stub_candidate = candidate.clone();
@@ -2406,10 +2435,18 @@ mod tests {
             )
         });
 
-        assert!(
-            !db.take_salsa_events()
-                .iter()
-                .any(|event| { matches!(event.kind, salsa::EventKind::WillExecute { .. }) })
+        // The directory-listing pre-filter consulted at the top of
+        // `resolve_name_impl` re-validates against the bumped search-path
+        // revision, but salsa backdates its boolean result when the answer
+        // for this specific component is unchanged. The user-visible
+        // `resolve_module_query` for `foo` must therefore not be
+        // re-executed.
+        let events = db.take_salsa_events();
+        assert_function_query_was_not_run(
+            &db,
+            resolve_module_query,
+            ModuleNameIngredient::new(&db, foo_module_name, ModuleResolveMode::StubsAllowed),
+            &events,
         );
 
         assert_eq!(Some(foo_pieces), foo_pieces2);
