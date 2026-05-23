@@ -781,6 +781,13 @@ impl<'db> SystemOrVendoredPathRef<'db> {
         }
     }
 
+    pub(super) fn extension(&self) -> Option<&str> {
+        match self {
+            Self::System(system) => system.extension(),
+            Self::Vendored(vendored) => vendored.extension(),
+        }
+    }
+
     pub(super) fn parent<'a>(&'a self) -> Option<SystemOrVendoredPathRef<'a>>
     where
         'a: 'db,
