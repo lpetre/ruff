@@ -8,7 +8,7 @@ use ruff_benchmark::real_world_projects::{
 use std::fmt::Write;
 use std::ops::Range;
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use rayon::ThreadPoolBuilder;
 use rustc_hash::FxHashSet;
 
@@ -17,6 +17,7 @@ use ruff_db::diagnostic::{Diagnostic, DiagnosticId, Severity};
 use ruff_db::files::{File, system_path_to_file};
 use ruff_db::source::source_text;
 use ruff_db::system::{InMemorySystem, MemoryFileSystem, SystemPath, SystemPathBuf, TestSystem};
+use ty_module_resolver::{ModuleName, resolve_module};
 use ty_project::metadata::options::{AnalysisOptions, EnvironmentOptions, Options};
 use ty_project::metadata::python_version::SupportedPythonVersion;
 use ty_project::metadata::value::{RangedValue, RelativePathBuf};
@@ -1398,6 +1399,230 @@ fn datetype(criterion: &mut Criterion) {
     bench_project(&benchmark, criterion);
 }
 
+/// How many extra search-path entries to populate each fake search path with.
+///
+/// Real `site-packages` directories typically contain tens to hundreds of
+/// entries (each installed distribution contributes at least one). Populating
+/// the search paths gives `read_directory` realistic work to do and prevents
+/// the listing from being trivially small.
+const SEARCH_PATH_ENTRIES_PER_PATH: usize = 32;
+
+/// How many distinct missing modules to resolve per iteration.
+///
+/// Each iteration resolves several missing modules in a row to amortize the
+/// per-iteration salsa snapshot/event bookkeeping over real work.
+const MISSING_MODULES_PER_ITERATION: usize = 16;
+
+/// Builds a [`Case`] whose project has `num_search_paths` additional search
+/// paths configured via `extra-paths`. Each search path is a directory in the
+/// in-memory filesystem populated with `SEARCH_PATH_ENTRIES_PER_PATH` unrelated
+/// entries.
+fn setup_resolve_search_paths_case(num_search_paths: usize) -> Case {
+    let system = TestSystem::default();
+    let fs = system.memory_file_system().clone();
+
+    let file_path = "src/test.py";
+    fs.write_file_all(SystemPathBuf::from(file_path), "x = 1\n")
+        .unwrap();
+
+    let mut extra_paths = Vec::with_capacity(num_search_paths);
+    for i in 0..num_search_paths {
+        let search_path = SystemPathBuf::from(format!("/extra{i}"));
+        fs.create_directory_all(&search_path).unwrap();
+        // Populate each search path with realistic-looking entries that
+        // intentionally don't collide with the module names the benchmark
+        // resolves (those use `nonexistent_module_*`). This mimics a real
+        // `site-packages` directory full of unrelated packages.
+        for j in 0..SEARCH_PATH_ENTRIES_PER_PATH {
+            let entry = search_path.join(format!("unrelated_package_{j}"));
+            fs.write_file_all(entry.join("__init__.py"), "").unwrap();
+        }
+        extra_paths.push(RelativePathBuf::cli(search_path));
+    }
+
+    let src_root = SystemPath::new("/src");
+    let mut metadata = ProjectMetadata::discover(src_root, &system).unwrap();
+    metadata.apply_options(Options {
+        environment: Some(EnvironmentOptions {
+            python_version: Some(RangedValue::cli(SupportedPythonVersion::Py312)),
+            extra_paths: Some(extra_paths),
+            ..EnvironmentOptions::default()
+        }),
+        ..Options::default()
+    });
+
+    let db = ProjectDatabase::fallible(metadata, system).unwrap();
+    let file = system_path_to_file(&db, SystemPathBuf::from(file_path)).unwrap();
+    let file_path_buf = file.path(&db).as_system_path().unwrap().to_owned();
+
+    Case {
+        db,
+        fs,
+        file,
+        file_path: file_path_buf,
+    }
+}
+
+/// Benchmarks module resolution time as a function of the number of
+/// configured search paths.
+///
+/// Each iteration resolves a batch of distinct *missing* module names so that
+/// salsa caching of `resolve_module_query` doesn't kick in. The directory
+/// listings of the search paths themselves stay cached across iterations
+/// (those depend only on the search path), so what's being measured is the
+/// per-resolution cost of walking every search path: filesystem probes
+/// without the pre-filter, hash-set lookups with it.
+fn benchmark_resolve_missing_module_search_paths(criterion: &mut Criterion) {
+    setup_rayon();
+
+    let mut group = criterion.benchmark_group("ty_micro/resolve_missing_module_search_paths");
+    // 125 and 600 are intended to model medium/large/xlarge monorepo
+    // configurations where many `extra-paths` accumulate.
+    for &num_search_paths in &[0usize, 1, 5, 25, 125, 600] {
+        group.throughput(criterion::Throughput::Elements(
+            MISSING_MODULES_PER_ITERATION as u64,
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_search_paths),
+            &num_search_paths,
+            |b, &num_search_paths| {
+                let mut counter: u64 = 0;
+                b.iter_batched_ref(
+                    || setup_resolve_search_paths_case(num_search_paths),
+                    |case| {
+                        for _ in 0..MISSING_MODULES_PER_ITERATION {
+                            let name =
+                                ModuleName::new(&format!("nonexistent_module_{counter}")).unwrap();
+                            counter += 1;
+                            let resolved = resolve_module(&case.db, case.file, &name);
+                            assert!(resolved.is_none());
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+/// Benchmarks module resolution where the module is present in *one* of the
+/// configured search paths, and absent from all the others.
+///
+/// This represents the common real-world case where third-party packages live
+/// in `site-packages` and have to be located by scanning several other search
+/// paths first. With the pre-filter, search paths that don't contain the
+/// component should drop out cheaply.
+fn benchmark_resolve_present_module_search_paths(criterion: &mut Criterion) {
+    setup_rayon();
+
+    let mut group = criterion.benchmark_group("ty_micro/resolve_present_module_search_paths");
+    for &num_search_paths in &[1usize, 5, 25, 125, 600] {
+        group.throughput(criterion::Throughput::Elements(
+            MISSING_MODULES_PER_ITERATION as u64,
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_search_paths),
+            &num_search_paths,
+            |b, &num_search_paths| {
+                let mut counter: u64 = 0;
+                b.iter_batched_ref(
+                    || {
+                        let case = setup_resolve_search_paths_case(num_search_paths);
+                        // Place one resolvable module in the *last* search
+                        // path. This forces the resolver to skip past every
+                        // other search path before finding it.
+                        if num_search_paths > 0 {
+                            let target_path = SystemPathBuf::from(format!(
+                                "/extra{}/target_module.py",
+                                num_search_paths - 1
+                            ));
+                            case.fs.write_file_all(target_path, "").unwrap();
+                        }
+                        case
+                    },
+                    |case| {
+                        for _ in 0..MISSING_MODULES_PER_ITERATION {
+                            // Alternate between the present module and a
+                            // missing one so that no single resolution result
+                            // gets cached across iterations.
+                            let name = if counter.is_multiple_of(2) && num_search_paths > 0 {
+                                ModuleName::new("target_module").unwrap()
+                            } else {
+                                ModuleName::new(&format!("nonexistent_module_{counter}")).unwrap()
+                            };
+                            counter += 1;
+                            let _ = resolve_module(&case.db, case.file, &name);
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
+/// A representative handful of module names that an application typically
+/// imports. They're stdlib modules, so they all resolve to the vendored
+/// typeshed — but the resolver still has to consider every search path on
+/// the first iteration for each name before reaching the stdlib search path.
+static STATIC_MODULE_NAMES: &[&str] = &[
+    "os",
+    "sys",
+    "json",
+    "typing",
+    "collections",
+    "pathlib",
+    "re",
+    "datetime",
+    "asyncio",
+    "logging",
+    "tempfile",
+    "subprocess",
+    "argparse",
+    "functools",
+    "itertools",
+    "warnings",
+];
+
+/// Benchmarks module resolution with a fixed, realistic pool of module names
+/// being resolved across an increasing number of configured search paths.
+///
+/// Each iteration uses a *fresh* `ProjectDatabase` so all salsa caches start
+/// cold. Within a single iteration the search-path listings get computed once
+/// per search path, then the same handful of module names are resolved
+/// against them. This mirrors a session that opens a project and checks a
+/// file whose imports are common stdlib names — a much more representative
+/// workload than the parameterized "all module names are unique" variant.
+fn benchmark_resolve_static_modules_search_paths(criterion: &mut Criterion) {
+    setup_rayon();
+
+    let mut group = criterion.benchmark_group("ty_micro/resolve_static_modules_search_paths");
+    for &num_search_paths in &[0usize, 1, 5, 25, 125, 600] {
+        group.throughput(criterion::Throughput::Elements(
+            STATIC_MODULE_NAMES.len() as u64,
+        ));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(num_search_paths),
+            &num_search_paths,
+            |b, &num_search_paths| {
+                b.iter_batched(
+                    || setup_resolve_search_paths_case(num_search_paths),
+                    |case| {
+                        for name_str in STATIC_MODULE_NAMES {
+                            let name = ModuleName::new(name_str).unwrap();
+                            let _ = resolve_module(&case.db, case.file, &name);
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(check_file, benchmark_cold, benchmark_incremental);
 criterion_group!(
     micro,
@@ -1422,6 +1647,9 @@ criterion_group!(
     benchmark_literal_equality_fallthrough_guarded_any,
     benchmark_typeis_narrowing,
     benchmark_pandas_tdd,
+    benchmark_resolve_missing_module_search_paths,
+    benchmark_resolve_present_module_search_paths,
+    benchmark_resolve_static_modules_search_paths,
 );
 criterion_group!(project, anyio, attrs, hydra, datetype);
 criterion_main!(check_file, micro, project);

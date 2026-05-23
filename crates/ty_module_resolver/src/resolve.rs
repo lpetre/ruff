@@ -46,6 +46,7 @@ use ruff_python_ast::{
 };
 
 use crate::db::Db;
+use crate::list::search_paths_for_root_component;
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
@@ -158,7 +159,7 @@ pub enum ModuleResolveMode {
 #[salsa::interned(heap_size=ruff_memory_usage::heap_size)]
 #[derive(Debug)]
 pub(crate) struct ModuleResolveModeIngredient<'db> {
-    mode: ModuleResolveMode,
+    pub(crate) mode: ModuleResolveMode,
 }
 
 impl ModuleResolveMode {
@@ -692,6 +693,13 @@ impl SearchPaths {
         }
     }
 
+    /// Returns `true` if at least one `site-packages` search path is
+    /// configured. Used as a heuristic to decide whether building the
+    /// root-component index pays off.
+    pub(crate) fn has_site_packages(&self) -> bool {
+        !self.site_packages.is_empty()
+    }
+
     /// Registers the file roots for all non-dynamically discovered search paths that aren't first-party.
     pub fn try_register_static_roots(&self, db: &dyn Db) {
         let files = db.files();
@@ -1064,10 +1072,23 @@ struct ModuleNameIngredient<'db> {
 }
 
 /// Given a module name and a list of search paths in which to lookup modules,
-/// attempt to resolve the module name
+/// attempt to resolve the module name.
+///
+/// When site-packages are configured, narrows the candidate search paths via
+/// [`search_paths_for_root_component`] so most resolutions hit a single
+/// index lookup instead of probing every search path. For configurations
+/// without site-packages there are typically only a handful of search paths,
+/// so the index isn't worth its upfront cost — fall back to the direct
+/// iteration in that case.
 fn resolve_name(db: &dyn Db, name: &ModuleName, mode: ModuleResolveMode) -> Option<ResolvedNames> {
-    let search_paths = search_paths(db, mode);
-    resolve_name_impl(db, name, mode, search_paths)
+    if db.search_paths().has_site_packages() {
+        let candidates = search_paths_for_root_component(db, name.first_component(), mode);
+        if candidates.is_empty() {
+            return None;
+        }
+        return resolve_name_impl(db, name, mode, candidates.iter());
+    }
+    resolve_name_impl(db, name, mode, search_paths(db, mode))
 }
 
 /// Like `resolve_name` but for cases where it failed to resolve the module

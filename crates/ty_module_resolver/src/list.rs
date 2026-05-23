@@ -1,12 +1,19 @@
 use std::collections::btree_map::{BTreeMap, Entry};
 
+use camino::Utf8Path;
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use ruff_python_ast::PythonVersion;
+use ruff_python_stdlib::identifiers::is_identifier;
 
 use crate::db::Db;
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
-use crate::resolve::{ModuleResolveMode, ResolverContext, resolve_file_module, search_paths};
+use crate::resolve::{
+    ModuleResolveMode, ModuleResolveModeIngredient, ResolverContext, resolve_file_module,
+    search_paths,
+};
 
 /// List all available modules, including all sub-modules, sorted in lexicographic order.
 pub fn all_modules(db: &dyn Db) -> Vec<Module<'_>> {
@@ -65,6 +72,141 @@ pub fn list_modules(db: &dyn Db) -> Vec<Module<'_>> {
 struct SearchPathIngredient<'db> {
     #[returns(ref)]
     path: SearchPath,
+}
+
+/// Maps each top-level module component (e.g. `foo` for an import of
+/// `foo.bar.baz`) to the ordered list of search paths that could yield a
+/// module by that name — a regular/namespace/stub package directory or a
+/// single-file `foo.py(i)`. Used by `resolve_name` to narrow the candidate
+/// search paths before probing the filesystem.
+pub(crate) fn search_paths_for_root_component<'db>(
+    db: &'db dyn Db,
+    component: &str,
+    mode: ModuleResolveMode,
+) -> &'db [SearchPath] {
+    // Goes through a per-component tracked query so Salsa can backdate the
+    // result when an unrelated entry changes elsewhere in the index.
+    search_paths_for_root_component_impl(
+        db,
+        ComponentNameIngredient::new(db, Box::from(component)),
+        ModuleResolveModeIngredient::new(db, mode),
+    )
+    .as_slice()
+}
+
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn search_paths_for_root_component_impl<'db>(
+    db: &'db dyn Db,
+    component: ComponentNameIngredient<'db>,
+    mode: ModuleResolveModeIngredient<'db>,
+) -> Vec<SearchPath> {
+    root_component_index(db, mode)
+        .get(component.name(db))
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
+struct ComponentNameIngredient<'db> {
+    #[returns(ref)]
+    name: Box<str>,
+}
+
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn root_component_index<'db>(
+    db: &'db dyn Db,
+    mode: ModuleResolveModeIngredient<'db>,
+) -> FxHashMap<Box<str>, Vec<SearchPath>> {
+    let mut index: FxHashMap<Box<str>, Vec<SearchPath>> = FxHashMap::default();
+    for search_path in search_paths(db, mode.mode(db)) {
+        let entries =
+            search_path_entry_names(db, SearchPathIngredient::new(db, search_path.clone()));
+        for component in components_provided_by(entries) {
+            index
+                .entry(component)
+                .or_default()
+                .push(search_path.clone());
+        }
+    }
+    index
+}
+
+/// Components that an entry at the root of a search path could yield as a
+/// top-level module — `foo/`, `foo-stubs/`, `foo.py`, `foo.pyi`. Generous on
+/// purpose: false positives are fine (the resolver re-checks each candidate)
+/// but false negatives are not. Names that aren't valid Python identifiers
+/// can never be resolved as components, so they're filtered out.
+fn components_provided_by(entries: &FxHashMap<Box<str>, FileType>) -> FxHashSet<Box<str>> {
+    let mut out = FxHashSet::default();
+    for (name, file_type) in entries {
+        let path = Utf8Path::new(name.as_ref());
+        let is_python_file = path.extension().is_some_and(is_python_extension);
+
+        // Directory candidates: real directories, plus symlinks that don't
+        // *look* like Python files (those are handled by the file branch
+        // below). A symlink to a directory keeps directory semantics; a
+        // symlink whose name ends in `.py(i)` is treated as a file.
+        let is_directory_like = matches!(file_type, FileType::Directory)
+            || (matches!(file_type, FileType::Symlink) && !is_python_file);
+        if is_directory_like {
+            if is_identifier(name) {
+                out.insert(name.clone());
+            }
+            if let Some(stripped) = name.strip_suffix("-stubs")
+                && is_identifier(stripped)
+            {
+                out.insert(Box::from(stripped));
+            }
+        }
+
+        // File candidates: regular files with a Python extension, plus
+        // symlinks whose name ends in `.py(i)`.
+        if matches!(file_type, FileType::File)
+            || (matches!(file_type, FileType::Symlink) && is_python_file)
+        {
+            if is_python_file
+                && let Some(stem) = path.file_stem()
+                && is_identifier(stem)
+            {
+                out.insert(Box::from(stem));
+            }
+        }
+    }
+    out
+}
+
+/// Reads the directory at the search path's root once and returns each entry
+/// name with its file type. Registers a dependency on the search path's
+/// `FileRoot::revision` so it invalidates on add/remove.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn search_path_entry_names<'db>(
+    db: &'db dyn Db,
+    search_path: SearchPathIngredient<'db>,
+) -> FxHashMap<Box<str>, FileType> {
+    let mut entries = FxHashMap::default();
+    match search_path.path(db).as_path() {
+        SystemOrVendoredPathRef::System(p) => {
+            if let Some(root) = db.files().root(db, p) {
+                let _ = root.revision(db);
+            }
+            let Ok(it) = db.system().read_directory(p) else {
+                return entries;
+            };
+            for entry in it.flatten() {
+                if let Some(name) = entry.path().file_name() {
+                    entries.insert(Box::from(name), entry.file_type().into());
+                }
+            }
+        }
+        SystemOrVendoredPathRef::Vendored(p) => {
+            for entry in db.vendored().read_directory(p) {
+                if let Some(name) = entry.path().file_name() {
+                    entries.insert(Box::from(name), entry.file_type().into());
+                }
+            }
+        }
+    }
+    entries
 }
 
 /// List all available top-level modules in the given `SearchPath`.
@@ -347,8 +489,8 @@ impl<'db> Lister<'db> {
 }
 
 /// The type of a file.
-#[derive(Clone, Copy, Debug)]
-enum FileType {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, get_size2::GetSize)]
+pub(crate) enum FileType {
     File,
     Directory,
     Symlink,
