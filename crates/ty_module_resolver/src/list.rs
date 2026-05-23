@@ -4,6 +4,7 @@ use rustc_hash::FxHashMap;
 
 use ruff_db::system::SystemPath;
 use ruff_python_ast::PythonVersion;
+use ruff_python_ast::name::Name;
 
 use crate::db::Db;
 use crate::module::{Module, ModuleKind};
@@ -95,7 +96,10 @@ fn list_modules_in<'db>(
 #[derive(Clone, Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct TopLevelEntry {
     /// The basename of the directory entry (no parent path components).
-    name: String,
+    ///
+    /// Stored as a [`Name`] so short filenames (the common case for Python
+    /// packages) stay inline and don't hit the heap.
+    name: Name,
     file_type: FileType,
 }
 
@@ -133,7 +137,7 @@ fn top_level_entries_in<'db>(
                     continue;
                 };
                 entries.push(TopLevelEntry {
-                    name: name.to_owned(),
+                    name: Name::new(name),
                     file_type: entry.file_type().into(),
                 });
             }
@@ -146,7 +150,7 @@ fn top_level_entries_in<'db>(
             .filter_map(|entry| {
                 let name = entry.path().file_name()?;
                 Some(TopLevelEntry {
-                    name: name.to_owned(),
+                    name: Name::new(name),
                     file_type: entry.file_type().into(),
                 })
             })
@@ -177,8 +181,8 @@ fn top_level_entries_in<'db>(
 pub(crate) fn root_to_search_paths<'db>(
     db: &'db dyn Db,
     mode: ModuleResolveModeIngredient<'db>,
-) -> FxHashMap<String, Vec<SearchPath>> {
-    let mut map: FxHashMap<String, Vec<SearchPath>> = FxHashMap::default();
+) -> FxHashMap<Name, Vec<SearchPath>> {
+    let mut map: FxHashMap<Name, Vec<SearchPath>> = FxHashMap::default();
     for search_path in search_paths(db, mode.mode(db)) {
         let ingredient = SearchPathIngredient::new(db, search_path.clone());
         for entry in top_level_entries_in(db, ingredient) {
@@ -211,8 +215,8 @@ pub(crate) fn root_to_search_paths<'db>(
 /// the index can't distinguish them without hitting the filesystem. Mirroring
 /// the filter in `Lister::add_entry` (drop entries with non-Python
 /// extensions) covers both cases correctly.
-fn entry_to_root_component(entry: &TopLevelEntry) -> Option<String> {
-    let name_path = SystemPath::new(&entry.name);
+fn entry_to_root_component(entry: &TopLevelEntry) -> Option<Name> {
+    let name_path = SystemPath::new(entry.name.as_str());
 
     if let Some(ext) = name_path.extension()
         && !is_python_extension(ext)
@@ -236,7 +240,14 @@ fn entry_to_root_component(entry: &TopLevelEntry) -> Option<String> {
         return None;
     }
 
-    Some(canonical.to_ascii_lowercase())
+    // Avoid the heap allocation that `to_ascii_lowercase` always performs
+    // when the input is already lowercase (the common case for Python
+    // packages). Short names stay inline in `Name`'s `CompactString`.
+    if canonical.bytes().any(|b| b.is_ascii_uppercase()) {
+        Some(Name::new(canonical.to_ascii_lowercase()))
+    } else {
+        Some(Name::new(canonical))
+    }
 }
 
 /// A module paired with whether it came from a stub package.
@@ -286,6 +297,7 @@ impl<'db> Lister<'db> {
     /// used to create this `Lister`.
     fn add_entry(&mut self, entry: &TopLevelEntry) {
         let TopLevelEntry { name, file_type } = entry;
+        let name = name.as_str();
         let mut has_py_extension = false;
         // We must have no extension, a Python source file extension (`.py`)
         // or a Python stub file extension (`.pyi`).
