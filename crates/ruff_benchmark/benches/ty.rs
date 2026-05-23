@@ -1476,7 +1476,9 @@ fn benchmark_resolve_missing_module_search_paths(criterion: &mut Criterion) {
     setup_rayon();
 
     let mut group = criterion.benchmark_group("ty_micro/resolve_missing_module_search_paths");
-    for &num_search_paths in &[0usize, 1, 5, 10, 25, 100] {
+    // 125 and 600 are intended to model medium/large/xlarge monorepo
+    // configurations where many `extra-paths` accumulate.
+    for &num_search_paths in &[0usize, 1, 5, 25, 125, 600] {
         group.throughput(criterion::Throughput::Elements(
             MISSING_MODULES_PER_ITERATION as u64,
         ));
@@ -1515,7 +1517,7 @@ fn benchmark_resolve_present_module_search_paths(criterion: &mut Criterion) {
     setup_rayon();
 
     let mut group = criterion.benchmark_group("ty_micro/resolve_present_module_search_paths");
-    for &num_search_paths in &[1usize, 5, 10, 25, 100] {
+    for &num_search_paths in &[1usize, 5, 25, 125, 600] {
         group.throughput(criterion::Throughput::Elements(
             MISSING_MODULES_PER_ITERATION as u64,
         ));
