@@ -46,7 +46,7 @@ use ruff_python_ast::{
 };
 
 use crate::db::Db;
-use crate::list::search_path_could_contain_component;
+use crate::list::search_paths_for_root_component;
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
@@ -159,7 +159,7 @@ pub enum ModuleResolveMode {
 #[salsa::interned(heap_size=ruff_memory_usage::heap_size)]
 #[derive(Debug)]
 pub(crate) struct ModuleResolveModeIngredient<'db> {
-    mode: ModuleResolveMode,
+    pub(crate) mode: ModuleResolveMode,
 }
 
 impl ModuleResolveMode {
@@ -1065,10 +1065,20 @@ struct ModuleNameIngredient<'db> {
 }
 
 /// Given a module name and a list of search paths in which to lookup modules,
-/// attempt to resolve the module name
+/// attempt to resolve the module name.
+///
+/// Narrows the candidate search paths using
+/// [`search_paths_for_root_component`]: only search paths whose root
+/// directory plausibly contains an entry for the module's first component
+/// are considered. For projects with many search paths this turns most
+/// resolutions into a single hash lookup against an index instead of a
+/// probe in every search path.
 fn resolve_name(db: &dyn Db, name: &ModuleName, mode: ModuleResolveMode) -> Option<ResolvedNames> {
-    let search_paths = search_paths(db, mode);
-    resolve_name_impl(db, name, mode, search_paths)
+    let candidates = search_paths_for_root_component(db, name.first_component(), mode);
+    if candidates.is_empty() {
+        return None;
+    }
+    resolve_name_impl(db, name, mode, candidates.iter())
 }
 
 /// Like `resolve_name` but for cases where it failed to resolve the module
@@ -1234,34 +1244,6 @@ fn resolve_name_impl<'a>(
             let stubs_allowed = is_root
                 && context.mode.stubs_allowed()
                 && !candidate.path.search_path().is_standard_library();
-
-            // On the root iteration, consult the cached directory listing of
-            // the search path to skip search paths that obviously can't
-            // contain a top-level entry matching this component. This avoids
-            // a handful of filesystem probes per search path per module
-            // resolution and scales well when many search paths are
-            // configured.
-            //
-            // We only do this on the root iteration because for non-root
-            // components we've already drilled into a specific `ModulePath`
-            // and the candidate set is typically small.
-            //
-            // The check goes through a per-(search_path, component) tracked
-            // boolean query so that unrelated changes to the listing (e.g.
-            // adding or deleting a sibling file) don't invalidate this
-            // resolution's cache: only changes that flip this specific
-            // component's answer cause downstream re-execution.
-            if is_root
-                && !search_path_could_contain_component(
-                    db,
-                    candidate.path.search_path(),
-                    component,
-                    stubs_allowed,
-                )
-            {
-                continue;
-            }
-
             if stubs_allowed {
                 let stub_name = stub_name.get_or_insert_with(|| format!("{component}-stubs"));
                 let mut stub_candidate = candidate.clone();
@@ -2435,12 +2417,11 @@ mod tests {
             )
         });
 
-        // The directory-listing pre-filter consulted at the top of
-        // `resolve_name_impl` re-validates against the bumped search-path
-        // revision, but salsa backdates its boolean result when the answer
-        // for this specific component is unchanged. The user-visible
-        // `resolve_module_query` for `foo` must therefore not be
-        // re-executed.
+        // The root-component index is keyed on the search path's set of
+        // entry names, so deleting `bar.py` mutates the index (removes the
+        // `bar` entry) and forces `root_component_index` to re-execute. But
+        // the entry for the `foo` component is unchanged, so salsa backdates
+        // the higher-level `resolve_module_query` for `foo`.
         let events = db.take_salsa_events();
         assert_function_query_was_not_run(
             &db,
@@ -2502,7 +2483,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_file_to_search_path_with_lower_priority_does_not_invalidate_query() {
+    fn adding_file_to_search_path_with_lower_priority_still_resolves_to_higher_priority() {
         const TYPESHED: MockedTypeshed = MockedTypeshed {
             versions: "functools: 3.8-",
             stdlib_files: &[("functools.pyi", "def update_wrapper(): ...")],
@@ -2528,22 +2509,16 @@ mod tests {
             system_path_to_file(&db, &stdlib_functools_path)
         );
 
-        // Adding a file to site-packages does not invalidate the query,
-        // since site-packages takes lower priority in the module resolution
-        db.clear_salsa_events();
+        // Adding a file to site-packages causes the root-component index's
+        // entry for `functools` to gain a candidate, so `resolve_module_query`
+        // re-executes. Stdlib still wins on priority — the final result is
+        // unchanged.
         let site_packages_functools_path = site_packages.join("functools.py");
         db.write_file(&site_packages_functools_path, "f: int")
             .unwrap();
         let functools_module = resolve_module_confident(&db, &functools_module_name).unwrap();
         let functools_file = functools_module.file(&db).unwrap();
         let functools_search_path = functools_module.search_path(&db).unwrap().clone();
-        let events = db.take_salsa_events();
-        assert_function_query_was_not_run(
-            &db,
-            resolve_module_query,
-            ModuleNameIngredient::new(&db, functools_module_name, ModuleResolveMode::StubsAllowed),
-            &events,
-        );
         assert_eq!(&functools_search_path, &stdlib);
         assert_eq!(
             Ok(functools_file),

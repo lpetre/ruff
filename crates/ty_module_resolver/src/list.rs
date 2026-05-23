@@ -1,7 +1,7 @@
 use std::collections::btree_map::{BTreeMap, Entry};
 
 use camino::Utf8Path;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use ruff_python_ast::PythonVersion;
 
@@ -9,7 +9,10 @@ use crate::db::Db;
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
-use crate::resolve::{ModuleResolveMode, ResolverContext, resolve_file_module, search_paths};
+use crate::resolve::{
+    ModuleResolveMode, ModuleResolveModeIngredient, ResolverContext, resolve_file_module,
+    search_paths,
+};
 
 /// List all available modules, including all sub-modules, sorted in lexicographic order.
 pub fn all_modules(db: &dyn Db) -> Vec<Module<'_>> {
@@ -70,91 +73,91 @@ struct SearchPathIngredient<'db> {
     path: SearchPath,
 }
 
-/// Cached directory listing for a search path's root: a map from each entry
-/// name (file or directory basename) to its file type.
+/// Returns the (entry-name → file-type) mapping for the root directory of
+/// the given search path.
 ///
-/// This is the shared primitive between [`list_modules_in`] (which classifies
-/// entries into Python modules) and module resolution (which uses it as a
-/// pre-filter at the root component to skip search paths that obviously
-/// can't contain a given top-level module).
-#[derive(Debug, Default, Clone, PartialEq, Eq, get_size2::GetSize)]
-pub(crate) struct SearchPathListing {
-    entries: FxHashMap<Box<str>, FileType>,
-}
-
-impl SearchPathListing {
-    fn insert(&mut self, name: &str, file_type: FileType) {
-        self.entries.insert(Box::from(name), file_type);
-    }
-
-    /// Returns true if this listing contains an entry that could plausibly
-    /// resolve to a top-level module named `component`.
-    ///
-    /// Specifically, this checks for any of:
-    /// - `component` (regular package, namespace package, or untyped directory)
-    /// - `component.py`, `component.pyi` (file modules)
-    /// - `component-stubs` (stub package, if `stubs_allowed`)
-    ///
-    /// This is a conservative pre-filter: it may return true even when no
-    /// matching module ultimately resolves (e.g. a directory shaped like a
-    /// package but without an `__init__.py(i)`). It must never return false
-    /// when a matching module does exist.
-    pub(crate) fn could_contain_module(&self, component: &str, stubs_allowed: bool) -> bool {
-        if self.entries.contains_key(component) {
-            return true;
-        }
-        let mut buf = String::with_capacity(component.len() + 6);
-        buf.push_str(component);
-        buf.push_str(".py");
-        if self.entries.contains_key(buf.as_str()) {
-            return true;
-        }
-        buf.push('i');
-        if self.entries.contains_key(buf.as_str()) {
-            return true;
-        }
-        if stubs_allowed {
-            buf.truncate(component.len());
-            buf.push_str("-stubs");
-            if self.entries.contains_key(buf.as_str()) {
-                return true;
-            }
-        }
-        false
-    }
-}
-
-/// Returns true if the search path's directory listing contains an entry
-/// that could plausibly resolve to a top-level module named `component`.
+/// This is the shared primitive for the directory-listing infrastructure:
+/// [`list_modules_in`] iterates it to classify entries into modules, and
+/// [`root_component_index`] iterates it to bucket entries by the top-level
+/// module name they can provide.
 ///
-/// This is a thin salsa wrapper over [`SearchPathListing::could_contain_module`]
-/// whose purpose is to give Salsa a chance to "backdate" the result: when the
-/// listing changes in a way that doesn't affect whether this specific
-/// component could resolve here, downstream queries that consulted this answer
-/// stay valid.
-pub(crate) fn search_path_could_contain_component(
-    db: &dyn Db,
-    search_path: &SearchPath,
-    component: &str,
-    stubs_allowed: bool,
-) -> bool {
-    search_path_could_contain_component_impl(
-        db,
-        SearchPathIngredient::new(db, search_path.clone()),
-        ComponentNameIngredient::new(db, Box::from(component)),
-        stubs_allowed,
-    )
-}
-
-#[salsa::tracked(heap_size=ruff_memory_usage::heap_size)]
-fn search_path_could_contain_component_impl<'db>(
+/// For system paths the query registers a dependency on the search path's
+/// [`FileRoot`] revision so it gets invalidated when files are added/removed.
+/// Vendored paths are immutable, so no revision dependency is needed.
+///
+/// [`FileRoot`]: ruff_db::files::FileRoot
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+pub(crate) fn search_path_entry_names<'db>(
     db: &'db dyn Db,
     search_path: SearchPathIngredient<'db>,
+) -> FxHashMap<Box<str>, FileType> {
+    tracing::debug!(
+        "Reading directory entries of search path '{}'",
+        search_path.path(db)
+    );
+    let mut entries = FxHashMap::default();
+    match search_path.path(db).as_path() {
+        SystemOrVendoredPathRef::System(p) => {
+            // Read the revision on the corresponding file root so that
+            // Salsa invalidates this query whenever the directory contents
+            // change. The lookup is conditional because ruff uses this
+            // code too and doesn't always set roots.
+            if let Some(root) = db.files().root(db, p) {
+                let _ = root.revision(db);
+            }
+
+            let Ok(it) = db.system().read_directory(p) else {
+                return entries;
+            };
+            for entry in it.flatten() {
+                if let Some(name) = entry.path().file_name() {
+                    entries.insert(Box::from(name), entry.file_type().into());
+                }
+            }
+        }
+        SystemOrVendoredPathRef::Vendored(p) => {
+            for entry in db.vendored().read_directory(p) {
+                if let Some(name) = entry.path().file_name() {
+                    entries.insert(Box::from(name), entry.file_type().into());
+                }
+            }
+        }
+    }
+    entries
+}
+
+/// Returns the ordered list of search paths whose root directory could
+/// plausibly yield a top-level module named `component`.
+///
+/// This is a thin per-component view over [`root_component_index`]. Going
+/// through a separately-tracked query lets Salsa backdate the result when
+/// the index changes but the slice for this specific component doesn't —
+/// e.g. when an unrelated sibling file is added or removed in one of the
+/// search paths. Without it, every entry-name change would invalidate every
+/// `resolve_module_query`.
+pub(crate) fn search_paths_for_root_component<'db>(
+    db: &'db dyn Db,
+    component: &str,
+    mode: ModuleResolveMode,
+) -> &'db [SearchPath] {
+    search_paths_for_root_component_impl(
+        db,
+        ComponentNameIngredient::new(db, Box::from(component)),
+        ModuleResolveModeIngredient::new(db, mode),
+    )
+    .as_slice()
+}
+
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn search_paths_for_root_component_impl<'db>(
+    db: &'db dyn Db,
     component: ComponentNameIngredient<'db>,
-    stubs_allowed: bool,
-) -> bool {
-    search_path_listing_impl(db, search_path)
-        .could_contain_module(component.name(db), stubs_allowed)
+    mode: ModuleResolveModeIngredient<'db>,
+) -> Vec<SearchPath> {
+    root_component_index(db, mode)
+        .get(component.name(db))
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[salsa::interned(debug, heap_size=ruff_memory_usage::heap_size)]
@@ -163,47 +166,72 @@ struct ComponentNameIngredient<'db> {
     name: Box<str>,
 }
 
+/// Index mapping a *root module component* (e.g. `foo` for an import of
+/// `foo.bar.baz`) to the ordered list of search paths whose root directory
+/// could yield a module by that name.
+///
+/// "Could yield" is intentionally generous: it covers regular packages
+/// (`foo/`), namespace packages (any directory named `foo`), stub packages
+/// (`foo-stubs/`), single-file modules (`foo.py`, `foo.pyi`) and symlinks
+/// that may resolve to any of the above. False positives are fine — the
+/// actual resolution logic in [`resolve_name_in_search_path`] still runs and
+/// rejects anything that doesn't pan out — but false negatives are not, so
+/// when in doubt entries are included.
+///
+/// The list of search paths for each component preserves [`search_paths`]
+/// iteration order so [`resolve_name_impl`] continues to honor search-path
+/// priority unchanged.
+///
+/// [`resolve_name_in_search_path`]: crate::resolve::resolve_name_in_search_path
+/// [`resolve_name_impl`]: crate::resolve::resolve_name_impl
 #[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
-fn search_path_listing_impl<'db>(
+pub(crate) fn root_component_index<'db>(
     db: &'db dyn Db,
-    search_path: SearchPathIngredient<'db>,
-) -> SearchPathListing {
-    tracing::debug!(
-        "Reading directory entries in search path '{}'",
-        search_path.path(db)
-    );
-    let mut listing = SearchPathListing::default();
-    match search_path.path(db).as_path() {
-        SystemOrVendoredPathRef::System(system_search_path) => {
-            // Read the revision on the corresponding file root to
-            // register an explicit dependency on this directory. When
-            // the revision gets bumped, the cache that Salsa creates
-            // for this routine will be invalidated.
-            //
-            // The lookup is conditional because ruff uses this code too
-            // and doesn't always set roots.
-            if let Some(root) = db.files().root(db, system_search_path) {
-                let _ = root.revision(db);
-            }
-
-            let Ok(entries) = db.system().read_directory(system_search_path) else {
-                return listing;
-            };
-            for entry in entries.flatten() {
-                if let Some(name) = entry.path().file_name() {
-                    listing.insert(name, entry.file_type().into());
-                }
-            }
-        }
-        SystemOrVendoredPathRef::Vendored(vendored_search_path) => {
-            for entry in db.vendored().read_directory(vendored_search_path) {
-                if let Some(name) = entry.path().file_name() {
-                    listing.insert(name, entry.file_type().into());
-                }
-            }
+    mode: ModuleResolveModeIngredient<'db>,
+) -> FxHashMap<Box<str>, Vec<SearchPath>> {
+    tracing::debug!("Building root component index");
+    let mut index: FxHashMap<Box<str>, Vec<SearchPath>> = FxHashMap::default();
+    for search_path in search_paths(db, mode.mode(db)) {
+        let ingredient = SearchPathIngredient::new(db, search_path.clone());
+        let entries = search_path_entry_names(db, ingredient);
+        let components = root_components_from_entries(entries);
+        for component in components {
+            index.entry(component).or_default().push(search_path.clone());
         }
     }
-    listing
+    index
+}
+
+/// Derives the set of top-level module-component names that the entries of a
+/// single search path collectively provide. See [`root_component_index`] for
+/// what counts as "provides".
+fn root_components_from_entries(
+    entries: &FxHashMap<Box<str>, FileType>,
+) -> FxHashSet<Box<str>> {
+    let mut components = FxHashSet::default();
+    for (name, file_type) in entries {
+        match file_type {
+            FileType::Directory | FileType::Symlink => {
+                // A directory `foo` could be a regular, namespace, or
+                // (with the suffix stripped) stub package.
+                components.insert(name.clone());
+                if let Some(stripped) = name.strip_suffix("-stubs") {
+                    components.insert(Box::from(stripped));
+                }
+            }
+            FileType::File => {}
+        }
+        // A file `foo.py(i)` provides `foo`; a directory `foo.py` is
+        // weird but harmless to include (false positives are fine, see
+        // the doc on `root_component_index`).
+        if let Some(ext) = Utf8Path::new(name.as_ref()).extension()
+            && is_python_extension(ext)
+            && let Some(stem) = Utf8Path::new(name.as_ref()).file_stem()
+        {
+            components.insert(Box::from(stem));
+        }
+    }
+    components
 }
 
 /// List all available top-level modules in the given `SearchPath`.
@@ -213,9 +241,9 @@ fn list_modules_in<'db>(
     search_path: SearchPathIngredient<'db>,
 ) -> Vec<ListedModule<'db>> {
     tracing::debug!("Listing modules in search path '{}'", search_path.path(db));
-    let listing = search_path_listing_impl(db, search_path);
+    let entries = search_path_entry_names(db, search_path);
     let mut lister = Lister::new(db, search_path.path(db));
-    for (name, file_type) in &listing.entries {
+    for (name, file_type) in entries {
         lister.add_entry(name, *file_type);
     }
     lister.into_modules()
