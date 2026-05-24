@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::btree_map::{BTreeMap, Entry};
 
 use rustc_hash::FxHashMap;
@@ -116,13 +117,14 @@ fn top_level_entries_in<'db>(
     let path = search_path.path(db);
     match path.as_path() {
         SystemOrVendoredPathRef::System(system_search_path) => {
-            // Read the revision on the corresponding file root to
-            // register an explicit dependency on this directory. When
-            // the revision gets bumped, the cache that Salsa creates
-            // for this routine will be invalidated. Some search paths
-            // (especially in tests) may not have a registered root; in
-            // that case we just skip the dependency and rely on the
-            // directory listing being stable across calls.
+            // Register a revision dependency on this directory so Salsa
+            // invalidates the cache when files are added or removed. In
+            // production, every search path is registered as a root by
+            // either `SearchPaths::try_register_static_roots`, the
+            // project setup, or the `.pth`-file walker — see resolve.rs.
+            // Direct uses of `TestDb` that bypass those code paths simply
+            // skip the dependency; that's only correct for snapshot-style
+            // tests that don't mutate the filesystem.
             if let Some(root) = db.files().root(db, system_search_path) {
                 let _ = root.revision(db);
             }
@@ -240,13 +242,21 @@ fn entry_to_root_component(entry: &TopLevelEntry) -> Option<Name> {
         return None;
     }
 
-    // Avoid the heap allocation that `to_ascii_lowercase` always performs
-    // when the input is already lowercase (the common case for Python
-    // packages). Short names stay inline in `Name`'s `CompactString`.
-    if canonical.bytes().any(|b| b.is_ascii_uppercase()) {
-        Some(Name::new(canonical.to_ascii_lowercase()))
+    Some(Name::new(ascii_lowercase_cow(canonical)))
+}
+
+/// ASCII-lowercases `s`, returning a borrowed slice when it's already
+/// lowercase (the common case for Python package names). The resolver's
+/// index key and the resolver's lookup key MUST go through the same
+/// normalization — `resolve_name` (in `resolve.rs`) calls this on the
+/// first component of a module name to look up keys this function
+/// installed.
+#[inline]
+pub(crate) fn ascii_lowercase_cow(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
     } else {
-        Some(Name::new(canonical))
+        Cow::Borrowed(s)
     }
 }
 

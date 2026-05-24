@@ -46,7 +46,7 @@ use ruff_python_ast::{
 };
 
 use crate::db::Db;
-use crate::list::root_to_search_paths;
+use crate::list::{ascii_lowercase_cow, root_to_search_paths};
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
@@ -1074,12 +1074,7 @@ fn resolve_name(db: &dyn Db, name: &ModuleName, mode: ModuleResolveMode) -> Opti
     // that obviously can't contain a top-level entry for this name avoids
     // a lot of per-name work on workloads with many editable installs or
     // site-packages directories.
-    let first = name.first_component();
-    let root: Cow<'_, str> = if first.bytes().any(|b| b.is_ascii_uppercase()) {
-        Cow::Owned(first.to_ascii_lowercase())
-    } else {
-        Cow::Borrowed(first)
-    };
+    let root = ascii_lowercase_cow(name.first_component());
     let index = root_to_search_paths(db, ModuleResolveModeIngredient::new(db, mode));
     let candidates = index.get(root.as_ref()).map(Vec::as_slice).unwrap_or(&[]);
     resolve_name_impl(db, name, mode, candidates.iter())
