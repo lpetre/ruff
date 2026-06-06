@@ -10,7 +10,7 @@ use rustc_hash::FxHashSet;
 use ty_python_core::definition::{DefinitionCategory, DefinitionKind, DefinitionState};
 use ty_python_core::place::ScopedPlaceId;
 use ty_python_core::scope::{FileScopeId, ScopeKind};
-use ty_python_core::{SemanticIndex, get_loop_header, semantic_index};
+use ty_python_core::{SemanticIndexRef, get_loop_header, semantic_index};
 
 /// Returns `true` for definition kinds that create user-facing bindings we consider for
 /// unused-binding diagnostics.
@@ -45,7 +45,7 @@ fn should_consider_definition(kind: &DefinitionKind<'_>) -> bool {
 
 fn function_scope_is_overload_declaration(
     db: &dyn Db,
-    index: &SemanticIndex<'_>,
+    index: &SemanticIndexRef<'_>,
     file_scope_id: FileScopeId,
 ) -> bool {
     let scope = index.scope(file_scope_id);
@@ -74,7 +74,7 @@ pub struct UnusedBinding {
 pub fn unused_bindings(db: &dyn Db, file: ruff_db::files::File) -> Vec<UnusedBinding> {
     let parsed = parsed_module(db, file).load(db);
     let is_stub_file = file.is_stub(db);
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
     let mut unused = Vec::new();
 
     for scope_id in index.scope_ids() {
@@ -95,7 +95,7 @@ pub fn unused_bindings(db: &dyn Db, file: ruff_db::files::File) -> Vec<UnusedBin
                 crate::types::function::function_has_stub_body(function.node(&parsed))
             });
         let function_is_overload_declaration =
-            function_scope_is_overload_declaration(db, index, file_scope_id);
+            function_scope_is_overload_declaration(db, &index, file_scope_id);
         let place_table = index.place_table(file_scope_id);
         let use_def_map = index.use_def_map(file_scope_id);
         // Loop headers are synthesized before the loop body definitions they point to;

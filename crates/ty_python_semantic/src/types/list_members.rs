@@ -504,7 +504,7 @@ impl<'db> AllMembers<'db> {
     ) {
         let class_body_scope = class_literal.body_scope(db);
         let file = class_body_scope.file(db);
-        let index = semantic_index(db, file);
+        let index = semantic_index(db, file).load(db);
         for function_scope_id in attribute_scopes(db, class_body_scope) {
             for place_expr in index.place_table(function_scope_id).members() {
                 let Some(name) = place_expr.as_instance_attribute() else {

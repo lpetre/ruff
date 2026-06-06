@@ -61,7 +61,7 @@ pub fn definitions_for_name<'db>(
 ) -> Vec<ResolvedDefinition<'db>> {
     let db = model.db();
     let file = model.file();
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
 
     // Get the scope for this name expression
     let Some(file_scope) = model.scope(node) else {
@@ -371,7 +371,7 @@ fn definitions_for_attribute_in_class_hierarchy<'db>(
 
         // Look for instance attributes in method scopes (e.g., self.x = 1)
         let file = class_scope.file(db);
-        let index = semantic_index(db, file);
+        let index = semantic_index(db, file).load(db);
 
         for function_scope_id in attribute_scopes(db, class_scope) {
             if let Some(place_id) = index
@@ -1985,7 +1985,7 @@ pub fn type_hierarchy_subtypes(db: &dyn Db, ty: Type<'_>) -> Vec<TypeHierarchyCl
             continue;
         }
 
-        let index = semantic_index(db, file);
+        let index = semantic_index(db, file).load(db);
         for scope_id in index.scope_ids() {
             let scope = scope_id.node(db);
             let Some(class_node) = scope.as_class() else {
@@ -1999,7 +1999,7 @@ pub fn type_hierarchy_subtypes(db: &dyn Db, ty: Type<'_>) -> Vec<TypeHierarchyCl
 
             let file_scope_id = scope_id.file_scope_id(db);
             let parsed = parsed_module(db, file).load(db);
-            if !is_range_reachable(db, index, file_scope_id, class_node.node(&parsed).range()) {
+            if !is_range_reachable(db, &index, file_scope_id, class_node.node(&parsed).range()) {
                 continue;
             }
 

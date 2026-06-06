@@ -169,9 +169,9 @@ pub(crate) fn infer_definition_types<'db>(
     )
     .entered();
 
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
 
-    TypeInferenceBuilder::new(db, InferenceRegion::Definition(definition), index, &module)
+    TypeInferenceBuilder::new(db, InferenceRegion::Definition(definition), &index, &module)
         .finish_definition()
 }
 
@@ -188,12 +188,12 @@ pub(crate) fn function_known_decorators<'db>(
 ) -> FunctionDecoratorInference<'db> {
     let file = definition.file(db);
     let module = parsed_module(db, file).load(db);
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
 
     TypeInferenceBuilder::new(
         db,
         InferenceRegion::FunctionDecorators(definition),
-        index,
+        &index,
         &module,
     )
     .finish_function_decorator_inference()
@@ -281,9 +281,9 @@ pub(crate) fn infer_deferred_types<'db>(
     )
     .entered();
 
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
 
-    TypeInferenceBuilder::new(db, InferenceRegion::Deferred(definition), index, &module)
+    TypeInferenceBuilder::new(db, InferenceRegion::Deferred(definition), &index, &module)
         .finish_definition()
 }
 
@@ -349,9 +349,10 @@ pub(crate) fn infer_scope_types_impl<'db>(
 
     // Using the index here is fine because the code below depends on the AST anyway.
     // The isolation of the query is by the return inferred types.
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
 
-    TypeInferenceBuilder::new(db, InferenceRegion::Scope(scope, tcx), index, &module).finish_scope()
+    TypeInferenceBuilder::new(db, InferenceRegion::Scope(scope, tcx), &index, &module)
+        .finish_scope()
 }
 
 /// Infer all types for an [`Expression`] (including sub-expressions).
@@ -390,12 +391,12 @@ pub(super) fn infer_expression_types_impl<'db>(
     )
     .entered();
 
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
 
     TypeInferenceBuilder::new(
         db,
         InferenceRegion::Expression(expression, tcx),
-        index,
+        &index,
         &module,
     )
     .finish_expression()
@@ -501,9 +502,9 @@ fn infer_statement_types_impl<'db>(
     )
     .entered();
 
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
 
-    TypeInferenceBuilder::new(db, InferenceRegion::Statement(statement), index, &module)
+    TypeInferenceBuilder::new(db, InferenceRegion::Statement(statement), &index, &module)
         .finish_statement()
 }
 

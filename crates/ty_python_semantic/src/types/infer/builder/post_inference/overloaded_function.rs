@@ -18,7 +18,7 @@ use crate::{
     },
 };
 use ty_python_core::{
-    SemanticIndex, definition::Definition, place::ScopedPlaceId, scope::NodeWithScopeKind,
+    SemanticIndexRef, definition::Definition, place::ScopedPlaceId, scope::NodeWithScopeKind,
 };
 
 /// Check the overloaded functions in this scope.
@@ -34,7 +34,7 @@ pub(crate) fn check_overloaded_function<'db>(
     ty: Type<'db>,
     definition: Definition<'db>,
     scope: &NodeWithScopeKind,
-    index: &SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
     seen_overloaded_places: &mut FxHashSet<ScopedPlaceId>,
     seen_public_functions: &mut FxHashSet<FunctionType<'db>>,
 ) {
