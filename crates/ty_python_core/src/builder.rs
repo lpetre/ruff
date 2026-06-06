@@ -1,6 +1,7 @@
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use except_handlers::TryNodeContextStackManager;
 use itertools::Itertools;
 use ruff_python_ast::helpers::{any_over_expr, is_dotted_name};
@@ -35,6 +36,7 @@ use crate::definition::{
 };
 use crate::expression::{Expression, ExpressionKind};
 use crate::member::MemberExprBuilder;
+use crate::node_key::NodeKey;
 use crate::place::{PlaceExpr, PlaceTableBuilder, PossiblyNarrowedPlacesBuilder, ScopedPlaceId};
 use crate::predicate::{
     CallableAndCallExpr, ClassPatternKind, PatternPredicate, PatternPredicateKind, Predicate,
@@ -59,7 +61,8 @@ use crate::use_def::{
 use crate::{Db, Statement, StatementNodeKey};
 use crate::{
     EvaluationMode, ExpressionsScopeMap, LoopHeader, LoopToken, NarrowingAliasPredicate,
-    PossiblyNarrowedPlaces, SemanticIndex, VisibleAncestorsIter, get_loop_header,
+    PossiblyNarrowedPlaces, ReusedIngredients, SemanticIndex, SemanticIndexInner,
+    VisibleAncestorsIter, get_loop_header,
 };
 
 use super::place::PlaceExprRef;
@@ -139,10 +142,28 @@ impl ConditionFlowSnapshot {
     }
 }
 
+/// Where the builder gets its Salsa ingredients ([`Definition`], [`Expression`], ...) from.
+///
+/// Ingredients can only be created while the `semantic_index` query executes. When the
+/// clearable part of the index is rebuilt after [`SemanticIndex::clear`], the builder runs
+/// inside whichever query happened to trigger the rebuild, so instead of creating new
+/// ingredients (which would have different identities than the originals), it looks the
+/// original ingredients up in the maps retained on the [`SemanticIndex`] handle. The walk is
+/// deterministic and node keys are stable within a Salsa revision, so the lookups always
+/// resolve to the ingredient created at the corresponding point of the initial build.
+#[derive(Copy, Clone)]
+enum IngredientSource<'db> {
+    /// Initial build inside the `semantic_index` query: create ingredients.
+    Create,
+    /// Rebuild after [`SemanticIndex::clear`]: reuse the ingredients stored on the handle.
+    Reuse(&'db SemanticIndex<'db>),
+}
+
 pub(super) struct SemanticIndexBuilder<'db, 'ast> {
     // Builder state
     db: &'db dyn Db,
     file: File,
+    source: IngredientSource<'db>,
     source_type: PySourceType,
     module: &'ast ParsedModuleRef,
     scope_stack: Vec<ScopeInfo<'ast>>,
@@ -206,13 +227,43 @@ pub(super) struct SemanticIndexBuilder<'db, 'ast> {
 
     /// Alias metadata for predicate leaf names in the current file.
     alias_predicates: FxHashMap<ExpressionNodeKey, NarrowingAliasPredicate<'db>>,
+
+    /// Ingredients that are only reachable from the clearable part of the index, recorded
+    /// during the initial build so that a rebuild can reuse them. Empty in reuse mode.
+    reused_ingredients: ReusedIngredients<'db>,
+
+    /// In reuse mode, tracks how many [`Definition`]s for a given key have already been
+    /// reused. Nodes that map to multiple definitions (`*` imports, loop headers) create them
+    /// in deterministic walk order, so handing them out in insertion order reproduces the
+    /// initial build. Empty in create mode.
+    definition_reuse_cursors: FxHashMap<DefinitionNodeKey, usize>,
 }
 
 impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
     pub(super) fn new(db: &'db dyn Db, file: File, module_ref: &'ast ParsedModuleRef) -> Self {
+        Self::new_impl(db, file, module_ref, IngredientSource::Create)
+    }
+
+    /// Creates a builder that rebuilds the clearable part of `index` after it has been
+    /// collected, reusing the ingredients stored on `index` instead of creating new ones.
+    pub(super) fn for_rebuild(
+        db: &'db dyn Db,
+        index: &'db SemanticIndex<'db>,
+        module_ref: &'ast ParsedModuleRef,
+    ) -> Self {
+        Self::new_impl(db, index.file(), module_ref, IngredientSource::Reuse(index))
+    }
+
+    fn new_impl(
+        db: &'db dyn Db,
+        file: File,
+        module_ref: &'ast ParsedModuleRef,
+        source: IngredientSource<'db>,
+    ) -> Self {
         let mut builder = Self {
             db,
             file,
+            source,
             source_type: file.source_type(db),
             module: module_ref,
             scope_stack: Vec::new(),
@@ -254,6 +305,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             semantic_syntax_errors: RefCell::default(),
             narrowing_aliases: FxHashMap::default(),
             alias_predicates: FxHashMap::default(),
+            reused_ingredients: ReusedIngredients::default(),
+            definition_reuse_cursors: FxHashMap::default(),
         };
 
         builder.push_scope_with_parent(NodeWithScopeRef::Module, None);
@@ -407,7 +460,14 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             .push(UseDefMapBuilder::new(is_class_scope));
         let ast_id_scope = self.ast_ids.push(AstIdsBuilder::default());
 
-        let scope_id = ScopeId::new(self.db, self.file, file_scope_id);
+        let scope_id = match self.source {
+            IngredientSource::Create => ScopeId::new(self.db, self.file, file_scope_id),
+            IngredientSource::Reuse(index) => {
+                let scope_id = index.scope_ids_by_scope[file_scope_id];
+                debug_assert_eq!(scope_id.file_scope_id(self.db), file_scope_id);
+                scope_id
+            }
+        };
 
         self.scope_ids_by_scope.push(scope_id);
         let previous = self.scopes_by_node.insert(node.node_key(), file_scope_id);
@@ -933,16 +993,20 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
             let Some(alias) = self.narrowing_aliases.get(&name.id).cloned() else {
                 return;
             };
-            let aliased_expression = Expression::new(
-                self.db,
-                self.file,
-                alias.expression_scope,
-                AstNodeRef::new(self.module, alias.expression),
-                None,
-                ExpressionKind::Normal,
-            );
+            let key = ExpressionNodeKey::from(leaf);
+            let aliased_expression = match self.source {
+                IngredientSource::Create => Expression::new(
+                    self.db,
+                    self.file,
+                    alias.expression_scope,
+                    AstNodeRef::new(self.module, alias.expression),
+                    None,
+                    ExpressionKind::Normal,
+                ),
+                IngredientSource::Reuse(index) => index.narrowing_alias_predicates[&key].expression,
+            };
             self.alias_predicates.insert(
-                ExpressionNodeKey::from(leaf),
+                key,
                 NarrowingAliasPredicate {
                     expression: aliased_expression,
                 },
@@ -1204,14 +1268,29 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let category = kind.category(self.source_type.is_stub(), self.module);
         let is_reexported = kind.is_reexported();
 
-        let definition: Definition<'db> = Definition::new(
-            self.db,
-            self.file,
-            self.current_scope(),
-            place,
-            kind,
-            is_reexported,
-        );
+        let definition: Definition<'db> = match self.source {
+            IngredientSource::Create => Definition::new(
+                self.db,
+                self.file,
+                self.current_scope(),
+                place,
+                kind,
+                is_reexported,
+            ),
+            IngredientSource::Reuse(index) => {
+                // A node can map to multiple definitions (`*` imports, loop headers), which
+                // the initial build created in this same deterministic walk order.
+                let cursor = self
+                    .definition_reuse_cursors
+                    .entry(definition_node.key())
+                    .or_default();
+                let definition = index.definitions_by_node[&definition_node.key()][*cursor];
+                *cursor += 1;
+                debug_assert_eq!(definition.place(self.db), place);
+                debug_assert_eq!(definition.file_scope(self.db), self.current_scope());
+                definition
+            }
+        };
 
         let num_definitions = {
             let definitions = self.add_entry_for_definition_key(definition_node.key());
@@ -1368,7 +1447,20 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         loop_stmt: LoopStmtRef<'ast>,
         bound_places: Vec<PlaceExpr>,
     ) -> (LoopToken<'db>, FxHashSet<ScopedPlaceId>, ScopedDefinitionId) {
-        let loop_token = LoopToken::new(self.db);
+        let loop_node_key = match loop_stmt {
+            LoopStmtRef::While(stmt) => NodeKey::from_node(stmt),
+            LoopStmtRef::For(stmt) => NodeKey::from_node(stmt),
+        };
+        let loop_token = match self.source {
+            IngredientSource::Create => {
+                let loop_token = LoopToken::new(self.db);
+                self.reused_ingredients
+                    .loop_tokens
+                    .insert(loop_node_key, loop_token);
+                loop_token
+            }
+            IngredientSource::Reuse(index) => index.reused_ingredients.loop_tokens[&loop_node_key],
+        };
         let mut bound_place_ids: FxHashSet<ScopedPlaceId> = FxHashSet::default();
         for place_expr in bound_places {
             let place_id = self.add_place(place_expr);
@@ -1423,7 +1515,13 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         // walked, but all our Salsa state is generally immutable. `specify` is how we work around
         // that. See this section of the Salsa docs:
         // <https://salsa-rs.github.io/salsa/overview.html#specify-the-result-of-tracked-functions-for-particular-structs>
-        get_loop_header::specify(self.db, loop_token, loop_header);
+        //
+        // When rebuilding, the reused `loop_token` was already associated with an identical
+        // `LoopHeader` during the initial build (and `specify` cannot be called from outside
+        // the query that created the token), so this step is skipped.
+        if matches!(self.source, IngredientSource::Create) {
+            get_loop_header::specify(self.db, loop_token, loop_header);
+        }
     }
 
     fn record_expression_narrowing_constraint(
@@ -1745,15 +1843,27 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let kind = self.predicate_kind(pattern);
         let guard = guard.map(|guard| self.add_standalone_expression(guard));
 
-        let pattern_predicate = PatternPredicate::new(
-            self.db,
-            self.file,
-            self.current_scope(),
-            subject,
-            kind,
-            guard,
-            previous_pattern.map(Box::new),
-        );
+        let pattern_node_key = NodeKey::from_node(pattern);
+        let pattern_predicate = match self.source {
+            IngredientSource::Create => {
+                let pattern_predicate = PatternPredicate::new(
+                    self.db,
+                    self.file,
+                    self.current_scope(),
+                    subject,
+                    kind,
+                    guard,
+                    previous_pattern.map(Box::new),
+                );
+                self.reused_ingredients
+                    .pattern_predicates
+                    .insert(pattern_node_key, pattern_predicate);
+                pattern_predicate
+            }
+            IngredientSource::Reuse(index) => {
+                index.reused_ingredients.pattern_predicates[&pattern_node_key]
+            }
+        };
 
         let predicate = PredicateOrLiteral::Predicate(Predicate {
             node: PredicateNode::Pattern(pattern_predicate),
@@ -1807,16 +1917,23 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         expression_kind: ExpressionKind,
         assigned_to: Option<&ast::StmtAssign>,
     ) -> Expression<'db> {
-        let expression = Expression::new(
-            self.db,
-            self.file,
-            self.current_scope(),
-            AstNodeRef::new(self.module, expression_node),
-            assigned_to.map(|assigned_to| AstNodeRef::new(self.module, assigned_to)),
-            expression_kind,
-        );
-        self.expressions_by_node
-            .insert(expression_node.into(), expression);
+        let key = ExpressionNodeKey::from(expression_node);
+        let expression = match self.source {
+            IngredientSource::Create => Expression::new(
+                self.db,
+                self.file,
+                self.current_scope(),
+                AstNodeRef::new(self.module, expression_node),
+                assigned_to.map(|assigned_to| AstNodeRef::new(self.module, assigned_to)),
+                expression_kind,
+            ),
+            IngredientSource::Reuse(index) => {
+                let expression = index.expressions_by_node[&key];
+                debug_assert_eq!(expression.file_scope(self.db), self.current_scope());
+                expression
+            }
+        };
+        self.expressions_by_node.insert(key, expression);
         expression
     }
 
@@ -1855,12 +1972,17 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         let statement = if let Some(statement) = statement {
             statement
         } else {
-            Statement::Other(StatementInner::new(
-                self.db,
-                self.file,
-                self.current_scope(),
-                AstNodeRef::new(self.module, statement_node),
-            ))
+            match self.source {
+                IngredientSource::Create => Statement::Other(StatementInner::new(
+                    self.db,
+                    self.file,
+                    self.current_scope(),
+                    AstNodeRef::new(self.module, statement_node),
+                )),
+                IngredientSource::Reuse(index) => {
+                    index.statements_by_node[&StatementNodeKey::from(statement_node)]
+                }
+            }
         };
 
         self.statements_by_node
@@ -2167,15 +2289,27 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                     } else {
                         self.current_scope()
                     };
-                let unpack = Some(Unpack::new(
-                    self.db,
-                    self.file,
-                    value_file_scope,
-                    self.current_scope(),
-                    // Note `target` belongs to the `self.module` tree
-                    AstNodeRef::new(self.module, target),
-                    UnpackValue::new(unpackable.kind(), value),
-                ));
+                let target_node_key = NodeKey::from_node(target);
+                let unpack = Some(match self.source {
+                    IngredientSource::Create => {
+                        let unpack = Unpack::new(
+                            self.db,
+                            self.file,
+                            value_file_scope,
+                            self.current_scope(),
+                            // Note `target` belongs to the `self.module` tree
+                            AstNodeRef::new(self.module, target),
+                            UnpackValue::new(unpackable.kind(), value),
+                        );
+                        self.reused_ingredients
+                            .unpacks
+                            .insert(target_node_key, unpack);
+                        unpack
+                    }
+                    IngredientSource::Reuse(index) => {
+                        index.reused_ingredients.unpacks[&target_node_key]
+                    }
+                });
                 Some(unpackable.as_current_assignment(unpack))
             }
             ast::Expr::Name(_)
@@ -2197,7 +2331,8 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         }
     }
 
-    pub(super) fn build(mut self) -> SemanticIndex<'db> {
+    /// Walks the module and runs the post-processing passes.
+    fn run(&mut self) {
         self.visit_body(self.module.suite());
 
         // Pop the root scope
@@ -2207,29 +2342,48 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         assert!(self.scope_stack.is_empty());
 
         assert_eq!(&self.current_assignments, &[]);
+    }
 
-        let mut place_tables: IndexVec<_, _> = self
-            .place_tables
+    /// Finishes the clearable per-scope analysis results.
+    fn finish_inner(&mut self) -> SemanticIndexInner<'db> {
+        let mut place_tables: IndexVec<_, _> = std::mem::take(&mut self.place_tables)
             .into_iter()
             .map(|builder| Arc::new(builder.finish()))
             .collect();
 
-        let mut use_def_maps: IndexVec<_, _> = self
-            .use_def_maps
+        let mut use_def_maps: IndexVec<_, _> = std::mem::take(&mut self.use_def_maps)
             .into_iter()
             .map(|builder| Arc::new(builder.finish()))
             .collect();
 
-        let mut ast_ids: IndexVec<_, _> = self
-            .ast_ids
+        let mut ast_ids: IndexVec<_, _> = std::mem::take(&mut self.ast_ids)
             .into_iter()
             .map(super::ast_ids::AstIdsBuilder::finish)
             .collect();
 
-        self.scopes.shrink_to_fit();
         place_tables.shrink_to_fit();
         use_def_maps.shrink_to_fit();
         ast_ids.shrink_to_fit();
+
+        let mut enclosing_snapshots = std::mem::take(&mut self.enclosing_snapshots);
+        enclosing_snapshots.shrink_to_fit();
+
+        SemanticIndexInner {
+            place_tables,
+            use_def_maps,
+            ast_ids,
+            enclosing_snapshots,
+        }
+    }
+
+    pub(super) fn build(mut self) -> SemanticIndex<'db> {
+        debug_assert!(matches!(self.source, IngredientSource::Create));
+
+        self.run();
+
+        let inner = self.finish_inner();
+
+        self.scopes.shrink_to_fit();
         self.definitions_by_node.shrink_to_fit();
         self.statements_by_node.shrink_to_fit();
         self.enclosing_lambda_statements.shrink_to_fit();
@@ -2239,29 +2393,49 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
         self.scope_ids_by_scope.shrink_to_fit();
         self.scopes_by_node.shrink_to_fit();
         self.generator_functions.shrink_to_fit();
-        self.enclosing_snapshots.shrink_to_fit();
+
+        self.reused_ingredients.shrink_to_fit();
 
         SemanticIndex {
-            place_tables,
+            file: self.file,
             scopes: self.scopes,
             definitions_by_node: self.definitions_by_node,
             expressions_by_node: self.expressions_by_node,
             statements_by_node: self.statements_by_node,
             scope_ids_by_scope: self.scope_ids_by_scope,
-            ast_ids,
             scopes_by_expression: self.scopes_by_expression.build(),
             scopes_by_node: self.scopes_by_node,
-            use_def_maps,
             enclosing_lambda_statements: self.enclosing_lambda_statements,
             collections_by_use: self.collections_by_use,
             uses_by_collection: self.uses_by_collection,
             imported_modules: Arc::new(self.imported_modules),
             has_future_annotations: self.has_future_annotations,
-            enclosing_snapshots: self.enclosing_snapshots,
             semantic_syntax_errors: self.semantic_syntax_errors.into_inner(),
             generator_functions: self.generator_functions,
             narrowing_alias_predicates: self.alias_predicates,
+            reused_ingredients: self.reused_ingredients,
+            inner: ArcSwapOption::new(Some(Arc::new(inner))),
         }
+    }
+
+    /// Rebuilds the clearable per-scope analysis results after [`SemanticIndex::clear`],
+    /// discarding the (identical) never-cleared data that the walk produces along the way.
+    pub(super) fn build_inner(mut self) -> SemanticIndexInner<'db> {
+        self.run();
+
+        // The rebuild must reproduce exactly the data of the initial build, because cached
+        // query results refer into it (by `ScopedUseId`, `ScopedPredicateId`, ...). Verify the
+        // never-cleared data we're about to discard matches the original as a proxy for the
+        // walks having been identical.
+        #[cfg(debug_assertions)]
+        if let IngredientSource::Reuse(index) = self.source {
+            debug_assert_eq!(self.definitions_by_node, index.definitions_by_node);
+            debug_assert_eq!(self.expressions_by_node, index.expressions_by_node);
+            debug_assert_eq!(self.statements_by_node, index.statements_by_node);
+            debug_assert_eq!(self.scope_ids_by_scope, index.scope_ids_by_scope);
+        }
+
+        self.finish_inner()
     }
 
     fn with_semantic_checker(&mut self, f: impl FnOnce(&mut SemanticSyntaxChecker, &Self)) {
@@ -2546,12 +2720,24 @@ impl<'db, 'ast> SemanticIndexBuilder<'db, 'ast> {
                         for export in exported_names(self.db, referenced_module) {
                             let symbol_id = self.add_symbol(export.clone());
                             let node_ref = StarImportDefinitionNodeRef { node, symbol_id };
-                            let star_import = StarImportPlaceholderPredicate::new(
-                                self.db,
-                                self.file,
-                                symbol_id,
-                                referenced_module,
-                            );
+                            let predicate_key = (NodeKey::from_node(node), symbol_id);
+                            let star_import = match self.source {
+                                IngredientSource::Create => {
+                                    let star_import = StarImportPlaceholderPredicate::new(
+                                        self.db,
+                                        self.file,
+                                        symbol_id,
+                                        referenced_module,
+                                    );
+                                    self.reused_ingredients
+                                        .star_import_predicates
+                                        .insert(predicate_key, star_import);
+                                    star_import
+                                }
+                                IngredientSource::Reuse(index) => {
+                                    index.reused_ingredients.star_import_predicates[&predicate_key]
+                                }
+                            };
 
                             let star_import_predicate = self.add_predicate(star_import.into());
 

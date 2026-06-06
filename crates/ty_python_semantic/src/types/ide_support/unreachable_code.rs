@@ -46,7 +46,7 @@ pub enum UnreachableKind {
 /// unreachable only under the current analysis.
 #[salsa::tracked(returns(deref), heap_size=ruff_memory_usage::heap_size)]
 pub fn unreachable_ranges(db: &dyn Db, file: File) -> Vec<UnreachableRange> {
-    let index = semantic_index(db, file);
+    let index = semantic_index(db, file).load(db);
     let mut unreachable = Vec::new();
 
     for scope_id in index.scope_ids() {

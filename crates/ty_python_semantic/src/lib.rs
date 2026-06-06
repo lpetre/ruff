@@ -33,7 +33,6 @@ use ty_python_core::program::Program;
 use ty_python_core::scope::ScopeId;
 use ty_python_core::{
     BindingWithConstraintsIterator, DeclarationsIterator, FileScopeId, attribute_scopes,
-    semantic_index,
 };
 pub use ty_site_packages::{
     PythonEnvironment, PythonVersionFileSource, PythonVersionSource, PythonVersionWithSource,
@@ -124,12 +123,12 @@ pub(crate) fn attribute_assignments<'db, 's>(
     name: &'s str,
 ) -> impl Iterator<Item = (BindingWithConstraintsIterator<'db, 'db>, FileScopeId)> + use<'s, 'db> {
     let file = class_body_scope.file(db);
-    let index = semantic_index(db, file);
 
-    attribute_scopes(db, class_body_scope).filter_map(|function_scope_id| {
-        let place_table = index.place_table(function_scope_id);
+    attribute_scopes(db, class_body_scope).filter_map(move |function_scope_id| {
+        let scope = function_scope_id.to_scope_id(db, file);
+        let place_table = ty_python_core::place_table(db, scope);
         let member = place_table.member_id_by_instance_attribute_name(name)?;
-        let use_def = index.use_def_map(function_scope_id);
+        let use_def = ty_python_core::use_def_map(db, scope);
         Some((use_def.reachable_member_bindings(member), function_scope_id))
     })
 }
@@ -145,12 +144,12 @@ pub(crate) fn attribute_declarations<'db, 's>(
     name: &'s str,
 ) -> impl Iterator<Item = (DeclarationsIterator<'db, 'db>, FileScopeId)> + use<'s, 'db> {
     let file = class_body_scope.file(db);
-    let index = semantic_index(db, file);
 
-    attribute_scopes(db, class_body_scope).filter_map(|function_scope_id| {
-        let place_table = index.place_table(function_scope_id);
+    attribute_scopes(db, class_body_scope).filter_map(move |function_scope_id| {
+        let scope = function_scope_id.to_scope_id(db, file);
+        let place_table = ty_python_core::place_table(db, scope);
         let member = place_table.member_id_by_instance_attribute_name(name)?;
-        let use_def = index.use_def_map(function_scope_id);
+        let use_def = ty_python_core::use_def_map(db, scope);
         Some((
             use_def.reachable_member_declarations(member),
             function_scope_id,

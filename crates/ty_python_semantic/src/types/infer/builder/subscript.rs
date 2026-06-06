@@ -33,7 +33,7 @@ use crate::types::{
     UnionTypeInstance, any_over_type, todo_type,
 };
 use crate::{Db, FxOrderSet};
-use ty_python_core::SemanticIndex;
+use ty_python_core::SemanticIndexRef;
 use ty_python_core::definition::Definition;
 use ty_python_core::place::{PlaceExpr, PlaceExprRef};
 use ty_python_core::scope::FileScopeId;
@@ -2007,7 +2007,7 @@ impl<'db> LegacyGenericContextError<'db> {
 /// either the resulting [`GenericContext`] or a [`SubscriptError`].
 fn infer_legacy_generic_subscript<'db>(
     db: &'db dyn Db,
-    index: &'db SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
     file_scope_id: FileScopeId,
     typevar_binding_context: Option<Definition<'db>>,
     slice_ty: Type<'db>,
@@ -2046,7 +2046,7 @@ fn infer_legacy_generic_subscript<'db>(
 /// that each argument is a type variable.
 fn legacy_generic_class_context<'db>(
     db: &'db dyn Db,
-    index: &'db SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
     file_scope_id: FileScopeId,
     typevar_binding_context: Option<Definition<'db>>,
     typevars: Type<'db>,

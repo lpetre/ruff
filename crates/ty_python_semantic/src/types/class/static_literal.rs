@@ -2863,7 +2863,7 @@ impl<'db> VarianceInferable<'db> for StaticClassLiteral<'db> {
         let class_body_scope = self.body_scope(db);
 
         let file = class_body_scope.file(db);
-        let index = semantic_index(db, file);
+        let index = semantic_index(db, file).load(db);
 
         let explicit_bases_variances = self
             .explicit_bases(db)

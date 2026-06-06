@@ -3,14 +3,14 @@ use crate::{
     place::{place_from_bindings, place_from_declarations},
     types::{context::InferContext, diagnostic::FINAL_WITHOUT_VALUE},
 };
-use ty_python_core::SemanticIndex;
+use ty_python_core::SemanticIndexRef;
 
 /// Check for `Final`-qualified declarations in module/function scopes that are never
 /// assigned a value. Class body scopes are handled separately in
 /// `check_class_final_without_value`.
 pub(crate) fn check_final_without_value<'db>(
     context: &InferContext<'db, '_>,
-    index: &SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
 ) {
     // In stub files, bare declarations without values are normal.
     if context.in_stub() {

@@ -53,7 +53,7 @@ use crate::{
     },
 };
 use crate::{attribute_assignments, types::diagnostic::abstract_method_span};
-use ty_python_core::{SemanticIndex, definition::DefinitionKind, scope::ScopeId};
+use ty_python_core::{SemanticIndexRef, definition::DefinitionKind, scope::ScopeId};
 
 /// Iterate over all static class definitions (created using `class` statements) to check that
 /// the definition is semantically valid and will not cause an exception to be raised at runtime.
@@ -73,7 +73,7 @@ pub(crate) fn check_static_class_definitions<'db>(
     context: &InferContext<'db, '_>,
     ty: Type<'db>,
     class_node: &ast::StmtClassDef,
-    index: &SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
     file_expression_type: &impl Fn(&ast::Expr) -> Type<'db>,
 ) {
     let db = context.db();
@@ -1285,7 +1285,7 @@ fn check_final_class_abstract_methods<'db>(
 fn check_class_final_without_value<'db>(
     context: &InferContext<'db, '_>,
     class: StaticClassLiteral<'db>,
-    index: &SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
 ) {
     // In stub files, bare declarations without values are normal.
     if context.in_stub() {
@@ -1347,7 +1347,7 @@ fn check_class_final_without_value<'db>(
 fn has_binding_in_init<'db>(
     context: &InferContext<'db, '_>,
     class_body_scope: ScopeId<'db>,
-    index: &SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
     name: &str,
 ) -> bool {
     let db = context.db();

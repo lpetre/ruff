@@ -116,8 +116,8 @@ use ty_python_core::place::{PlaceExpr, PlaceExprRef};
 use ty_python_core::scope::{FileScopeId, NodeWithScopeKind, NodeWithScopeRef, ScopeId, ScopeKind};
 use ty_python_core::symbol::{ScopedSymbolId, Symbol};
 use ty_python_core::{
-    ApplicableConstraints, EnclosingSnapshotResult, EvaluationMode, SemanticIndex, Truthiness,
-    place_table, unpack::UnpackPosition,
+    ApplicableConstraints, EnclosingSnapshotResult, EvaluationMode, SemanticIndex,
+    SemanticIndexRef, Truthiness, place_table, unpack::UnpackPosition,
 };
 use ty_python_core::{ExpressionNodeKey, Statement};
 
@@ -227,7 +227,7 @@ const NUM_FIELD_SPECIFIERS_INLINE: usize = 1;
 pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     context: InferContext<'db, 'ast>,
 
-    index: &'db SemanticIndex<'db>,
+    index: &'ast SemanticIndexRef<'db>,
     region: InferenceRegion<'db>,
 
     /// The types of every expression in this region.
@@ -341,7 +341,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     pub(super) fn new(
         db: &'db dyn Db,
         region: InferenceRegion<'db>,
-        index: &'db SemanticIndex<'db>,
+        index: &'ast SemanticIndexRef<'db>,
         module: &'ast ParsedModuleRef,
     ) -> Self {
         let scope = region.scope(db);
@@ -558,7 +558,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn setup_dataclass_field_specifiers(&mut self) {
         fn field_specifiers<'db>(
             db: &'db dyn Db,
-            index: &'db SemanticIndex<'db>,
+            index: &SemanticIndex<'db>,
             scope: ScopeId<'db>,
         ) -> Option<SmallVec<[Type<'db>; NUM_FIELD_SPECIFIERS_INLINE]>> {
             let enclosing_scope = index.scope(scope.file_scope_id(db));
