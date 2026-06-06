@@ -209,7 +209,7 @@ use ruff_text_size::TextRange;
 use rustc_hash::{FxHashMap, FxHashSet};
 use ty_python_core::{
     BindingWithConstraints, DeclarationWithConstraint, DeclarationsIterator, FileScopeId,
-    ScopedDefinitionId, SemanticIndex, Truthiness, UseDefMap,
+    ScopedDefinitionId, SemanticIndexRef, Truthiness, UseDefMap,
     definition::DefinitionState,
     place::ScopedPlaceId,
     place_table,
@@ -1173,7 +1173,7 @@ fn analyze_single(db: &dyn Db, predicate: &Predicate) -> Truthiness {
 /// scope reachability and statement-level reachability within the scope.
 pub(crate) fn is_range_reachable<'db>(
     db: &'db dyn crate::Db,
-    index: &SemanticIndex<'db>,
+    index: &SemanticIndexRef<'db>,
     scope_id: FileScopeId,
     range: TextRange,
 ) -> bool {

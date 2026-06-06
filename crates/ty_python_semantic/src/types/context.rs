@@ -202,9 +202,9 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
     /// This checks both whether the scope itself is reachable and whether the
     /// specific statement or expression containing this range is reachable.
     fn is_range_reachable(&self, range: TextRange) -> bool {
-        let index = semantic_index(self.db, self.file);
+        let index = semantic_index(self.db, self.file).load(self.db);
         let scope_id = self.scope.file_scope_id(self.db);
-        is_range_reachable(self.db, index, scope_id, range)
+        is_range_reachable(self.db, &index, scope_id, range)
     }
 
     /// Are we currently inferring types in a stub file?

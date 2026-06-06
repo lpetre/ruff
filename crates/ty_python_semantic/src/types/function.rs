@@ -421,7 +421,8 @@ impl<'db> OverloadLiteral<'db> {
         // here to get the previous function definition with the same name.
         let scope = self.definition(db).scope(db);
         let module = parsed_module(db, self.file(db)).load(db);
-        let use_def = semantic_index(db, scope.file(db)).use_def_map(scope.file_scope_id(db));
+        let index = semantic_index(db, scope.file(db)).load(db);
+        let use_def = index.use_def_map(scope.file_scope_id(db));
         let use_id = self
             .body_scope(db)
             .node(db)

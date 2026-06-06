@@ -2,6 +2,7 @@ use ruff_python_ast as ast;
 use std::iter::{FusedIterator, once};
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use itertools::Itertools;
 use ruff_db::files::File;
 use ruff_db::parsed::parsed_module;
@@ -15,8 +16,11 @@ use salsa::plumbing::AsId;
 use smallvec::SmallVec;
 use ty_module_resolver::ModuleName;
 
+use crate::node_key::NodeKey;
 use crate::place::ScopedPlaceId;
+use crate::predicate::{PatternPredicate, StarImportPlaceholderPredicate};
 pub use crate::statement::{Statement, StatementNodeKey};
+use crate::unpack::Unpack;
 use ast_ids::AstIds;
 pub use ast_ids::ExpressionNodeKey;
 use builder::SemanticIndexBuilder;
@@ -60,7 +64,11 @@ pub mod program;
 
 /// Returns the semantic index for `file`.
 ///
-/// Prefer using [`symbol_table`] when working with symbols from a single scope.
+/// The returned [`SemanticIndex`] is a handle: data that can be recomputed from the AST lives
+/// behind a cell that is populated on first access and can be cleared with
+/// [`SemanticIndex::clear`] to reduce memory usage. Call [`SemanticIndex::load`] to access it.
+///
+/// Prefer using [`place_table`] when working with places from a single scope.
 #[salsa::tracked(returns(ref), no_eq, heap_size=ruff_memory_usage::heap_size)]
 pub fn semantic_index(db: &dyn Db, file: File) -> SemanticIndex<'_> {
     let _span = tracing::trace_span!("semantic_index", ?file).entered();
@@ -79,8 +87,8 @@ pub fn semantic_index(db: &dyn Db, file: File) -> SemanticIndex<'_> {
 pub fn place_table<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> Arc<PlaceTable> {
     let file = scope.file(db);
     let _span = tracing::trace_span!("place_table", scope=?scope.as_id(), ?file).entered();
-    let index = semantic_index(db, file);
-    Arc::clone(&index.place_tables[scope.file_scope_id(db)])
+    let index = semantic_index(db, file).load(db);
+    Arc::clone(&index.inner.place_tables[scope.file_scope_id(db)])
 }
 
 /// Returns the use-def map for a specific `scope`.
@@ -92,8 +100,8 @@ pub fn place_table<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> Arc<PlaceTable>
 pub fn use_def_map<'db>(db: &'db dyn Db, scope: ScopeId<'db>) -> Arc<UseDefMap<'db>> {
     let file = scope.file(db);
     let _span = tracing::trace_span!("use_def_map", scope=?scope.as_id(), ?file).entered();
-    let index = semantic_index(db, file);
-    Arc::clone(&index.use_def_maps[scope.file_scope_id(db)])
+    let index = semantic_index(db, file).load(db);
+    Arc::clone(&index.inner.use_def_maps[scope.file_scope_id(db)])
 }
 
 /// All the bindings made in a loop, which are visible to the entire loop via "loop header
@@ -256,11 +264,24 @@ pub enum EnclosingSnapshotResult<'map, 'db> {
     NoLongerInEagerContext,
 }
 
-/// The place tables and use-def maps for all scopes in a file.
-#[derive(Debug, Update, get_size2::GetSize)]
+/// The semantic index for a single file.
+///
+/// This type is the handle returned by the [`semantic_index`] query. Similar to
+/// [`ruff_db::parsed::ParsedModule`], the per-scope analysis results — everything that can be
+/// deterministically recomputed from the AST — live in a cell that can be emptied with
+/// [`SemanticIndex::clear`] to reduce memory usage, and is lazily rebuilt on the next
+/// [`SemanticIndex::load`]. A particular instance of that data is represented by
+/// [`SemanticIndexRef`].
+///
+/// The fields stored directly on this struct are never cleared. Most of them hold Salsa
+/// ingredients (e.g. [`Definition`], [`Expression`]) created while the [`semantic_index`]
+/// query executed: ingredients cannot be recreated during a lazy rebuild (the rebuild runs
+/// inside whichever query happened to call [`SemanticIndex::load`]), so the rebuild *reuses*
+/// them by looking them up in these maps instead.
+#[derive(Debug, get_size2::GetSize)]
 pub struct SemanticIndex<'db> {
-    /// List of all place tables in this file, indexed by scope.
-    place_tables: IndexVec<FileScopeId, Arc<PlaceTable>>,
+    /// The file for which this semantic index was built.
+    file: File,
 
     /// List of all scopes in this file.
     scopes: IndexVec<FileScopeId, Scope>,
@@ -292,23 +313,11 @@ pub struct SemanticIndex<'db> {
     /// Map from the file-local [`FileScopeId`] to the salsa-ingredient [`ScopeId`].
     scope_ids_by_scope: IndexVec<FileScopeId, ScopeId<'db>>,
 
-    /// Use-def map for each scope in this file.
-    use_def_maps: IndexVec<FileScopeId, Arc<UseDefMap<'db>>>,
-
-    /// Lookup table to map between node ids and ast nodes.
-    ///
-    /// Note: We should not depend on this map when analysing other files or
-    /// changing a file invalidates all dependents.
-    ast_ids: IndexVec<FileScopeId, AstIds>,
-
     /// The set of modules that are imported anywhere within this file.
     imported_modules: Arc<FxHashSet<ModuleName>>,
 
     /// Flags about the global scope (code usage impacting inference)
     has_future_annotations: bool,
-
-    /// Map of all of the enclosing snapshots that appear in this file.
-    enclosing_snapshots: FxHashMap<EnclosingSnapshotKey, ScopedEnclosingSnapshotId>,
 
     /// List of all semantic syntax errors in this file.
     semantic_syntax_errors: Vec<SemanticSyntaxError>,
@@ -320,6 +329,219 @@ pub struct SemanticIndex<'db> {
     /// When a predicate references an alias variable (e.g., `is_none` from `is_none = x is None`),
     /// the alias Name node is mapped to its aliased expression for constraint-generation time.
     narrowing_alias_predicates: FxHashMap<ExpressionNodeKey, NarrowingAliasPredicate<'db>>,
+
+    /// Salsa ingredients that are only reachable from the clearable [`SemanticIndexInner`]
+    /// data, retained here so that a rebuild can reuse them.
+    reused_ingredients: ReusedIngredients<'db>,
+
+    /// The clearable per-scope analysis results. `None` after [`SemanticIndex::clear`] until
+    /// the next [`SemanticIndex::load`] rebuilds it.
+    #[get_size(size_fn = arc_swap_size)]
+    inner: ArcSwapOption<SemanticIndexInner<'db>>,
+}
+
+/// Salsa ingredients created during the initial [`semantic_index`] query execution that are
+/// referenced from the clearable [`SemanticIndexInner`] data (via the per-scope use-def maps'
+/// predicates and definition kinds) but aren't recorded in any of the other node-keyed maps on
+/// [`SemanticIndex`].
+///
+/// A rebuild after [`SemanticIndex::clear`] must produce data that's identical to the data
+/// produced by the initial build, but it cannot create new Salsa ingredients. These maps allow
+/// the rebuild to look the original ingredients up by their (revision-stable) node keys.
+#[derive(Debug, Default, get_size2::GetSize)]
+struct ReusedIngredients<'db> {
+    /// Map from a `match` case's pattern to its [`PatternPredicate`] ingredient.
+    pattern_predicates: FxHashMap<NodeKey, PatternPredicate<'db>>,
+
+    /// Map from a `from module import *` statement and one of the symbols it imports to the
+    /// symbol's [`StarImportPlaceholderPredicate`] ingredient.
+    star_import_predicates:
+        FxHashMap<(NodeKey, ScopedSymbolId), StarImportPlaceholderPredicate<'db>>,
+
+    /// Map from an unpacking assignment's target to its [`Unpack`] ingredient.
+    unpacks: FxHashMap<NodeKey, Unpack<'db>>,
+
+    /// Map from a `for`/`while` statement to the [`LoopToken`] referenced by its loop-header
+    /// definitions.
+    loop_tokens: FxHashMap<NodeKey, LoopToken<'db>>,
+}
+
+impl ReusedIngredients<'_> {
+    fn shrink_to_fit(&mut self) {
+        let Self {
+            pattern_predicates,
+            star_import_predicates,
+            unpacks,
+            loop_tokens,
+        } = self;
+
+        pattern_predicates.shrink_to_fit();
+        star_import_predicates.shrink_to_fit();
+        unpacks.shrink_to_fit();
+        loop_tokens.shrink_to_fit();
+    }
+}
+
+/// The clearable part of the semantic index: the per-scope analysis results.
+///
+/// This data is deterministically rebuilt from the AST (reusing the Salsa ingredients stored on
+/// [`SemanticIndex`]) when it is accessed after having been cleared.
+#[derive(Debug, PartialEq, Eq, get_size2::GetSize)]
+pub struct SemanticIndexInner<'db> {
+    /// List of all place tables in this file, indexed by scope.
+    place_tables: IndexVec<FileScopeId, Arc<PlaceTable>>,
+
+    /// Use-def map for each scope in this file.
+    use_def_maps: IndexVec<FileScopeId, Arc<UseDefMap<'db>>>,
+
+    /// Lookup table to map between node ids and ast nodes.
+    ///
+    /// Note: We should not depend on this map when analysing other files or
+    /// changing a file invalidates all dependents.
+    ast_ids: IndexVec<FileScopeId, AstIds>,
+
+    /// Map of all of the enclosing snapshots that appear in this file.
+    enclosing_snapshots: FxHashMap<EnclosingSnapshotKey, ScopedEnclosingSnapshotId>,
+}
+
+/// The `semantic_index` query is `no_eq`, so Salsa never diffs old and new values and a
+/// wholesale overwrite is sufficient.
+#[expect(unsafe_code)]
+unsafe impl Update for SemanticIndex<'_> {
+    unsafe fn maybe_update(old_pointer: *mut Self, new_value: Self) -> bool {
+        let old_ref = unsafe { &mut (*old_pointer) };
+        *old_ref = new_value;
+        true
+    }
+}
+
+/// Returns the heap-size of the currently stored `T` in the `ArcSwapOption`.
+fn arc_swap_size<T>(arc_swap: &ArcSwapOption<T>) -> usize
+where
+    T: get_size2::GetSize,
+{
+    if let Some(value) = &*arc_swap.load() {
+        T::get_heap_size(value)
+    } else {
+        0
+    }
+}
+
+/// Cheap cloneable wrapper around an instance of the clearable part of the semantic index.
+///
+/// Holding on to this reference prevents [`SemanticIndex::clear`] from freeing the data. It
+/// dereferences to [`SemanticIndex`], so the never-cleared parts of the index are accessible
+/// through it as well.
+#[derive(Clone)]
+pub struct SemanticIndexRef<'db> {
+    index: &'db SemanticIndex<'db>,
+    inner: Arc<SemanticIndexInner<'db>>,
+}
+
+impl<'db> std::ops::Deref for SemanticIndexRef<'db> {
+    type Target = SemanticIndex<'db>;
+
+    fn deref(&self) -> &Self::Target {
+        self.index
+    }
+}
+
+impl std::fmt::Debug for SemanticIndexRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SemanticIndexRef")
+            .field(&self.index)
+            .finish()
+    }
+}
+
+impl<'db> SemanticIndexRef<'db> {
+    /// Returns the place table for a specific scope.
+    ///
+    /// Use the Salsa cached [`place_table()`] query if you only need the
+    /// place table for a single scope.
+    #[track_caller]
+    pub fn place_table(&self, scope_id: FileScopeId) -> &PlaceTable {
+        &self.inner.place_tables[scope_id]
+    }
+
+    /// Returns the use-def map for a specific scope.
+    ///
+    /// Use the Salsa cached [`use_def_map()`] query if you only need the
+    /// use-def map for a single scope.
+    #[track_caller]
+    pub fn use_def_map(&self, scope_id: FileScopeId) -> &UseDefMap<'db> {
+        &self.inner.use_def_maps[scope_id]
+    }
+
+    #[track_caller]
+    pub(crate) fn ast_ids(&self, scope_id: FileScopeId) -> &AstIds {
+        &self.inner.ast_ids[scope_id]
+    }
+
+    pub fn symbol_is_global_in_scope(&self, symbol: ScopedSymbolId, scope: FileScopeId) -> bool {
+        self.place_table(scope).symbol(symbol).is_global()
+    }
+
+    pub fn symbol_is_nonlocal_in_scope(&self, symbol: ScopedSymbolId, scope: FileScopeId) -> bool {
+        self.place_table(scope).symbol(symbol).is_nonlocal()
+    }
+
+    pub fn is_in_type_checking_block(&self, scope_id: FileScopeId, range: TextRange) -> bool {
+        self.ancestor_scopes(scope_id).any(|(scope_id, _)| {
+            self.use_def_map(scope_id)
+                .is_range_in_type_checking_block(range)
+        })
+    }
+
+    /// Returns
+    /// * `NoLongerInEagerContext` if the nested scope is no longer in an eager context
+    ///   (that is, not every scope that will be traversed is eager) and no lazy snapshots were found.
+    /// *  an iterator of bindings for a particular nested scope reference if the bindings exist.
+    /// *  a narrowing constraint if there are no bindings, but there is a narrowing constraint for an enclosing scope place.
+    /// * `NotFound` if the narrowing constraint / bindings do not exist in the nested scope.
+    pub fn enclosing_snapshot(
+        &self,
+        enclosing_scope: FileScopeId,
+        expr: PlaceExprRef,
+        nested_scope: FileScopeId,
+    ) -> EnclosingSnapshotResult<'_, 'db> {
+        for (ancestor_scope_id, ancestor_scope) in self.ancestor_scopes(nested_scope) {
+            if ancestor_scope_id == enclosing_scope {
+                break;
+            }
+            if !ancestor_scope.is_eager() {
+                if let PlaceExprRef::Symbol(symbol) = expr
+                    && let Some(place_id) =
+                        self.inner.place_tables[enclosing_scope].symbol_id(symbol.name())
+                {
+                    let key = EnclosingSnapshotKey {
+                        enclosing_scope,
+                        enclosing_place: place_id.into(),
+                        nested_scope,
+                        nested_laziness: ScopeLaziness::Lazy,
+                    };
+                    if let Some(id) = self.inner.enclosing_snapshots.get(&key) {
+                        return self.inner.use_def_maps[enclosing_scope]
+                            .enclosing_snapshot(*id, key.nested_laziness);
+                    }
+                }
+                return EnclosingSnapshotResult::NoLongerInEagerContext;
+            }
+        }
+        let Some(place_id) = self.inner.place_tables[enclosing_scope].place_id(expr) else {
+            return EnclosingSnapshotResult::NotFound;
+        };
+        let key = EnclosingSnapshotKey {
+            enclosing_scope,
+            enclosing_place: place_id,
+            nested_scope,
+            nested_laziness: ScopeLaziness::Eager,
+        };
+        let Some(id) = self.inner.enclosing_snapshots.get(&key) else {
+            return EnclosingSnapshotResult::NotFound;
+        };
+        self.inner.use_def_maps[enclosing_scope].enclosing_snapshot(*id, key.nested_laziness)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
@@ -329,13 +551,43 @@ pub struct NarrowingAliasPredicate<'db> {
 }
 
 impl<'db> SemanticIndex<'db> {
-    /// Returns the place table for a specific scope.
+    /// Loads a reference to the clearable part of the semantic index.
     ///
-    /// Use the Salsa cached [`place_table()`] query if you only need the
-    /// place table for a single scope.
-    #[track_caller]
-    pub fn place_table(&self, scope_id: FileScopeId) -> &PlaceTable {
-        &self.place_tables[scope_id]
+    /// Note that holding on to the reference will prevent garbage collection of the data.
+    /// This method will rebuild the data (reusing the Salsa ingredients stored on `self`)
+    /// if it has been collected.
+    pub fn load(&'db self, db: &'db dyn Db) -> SemanticIndexRef<'db> {
+        let inner = match self.inner.load_full() {
+            Some(inner) => inner,
+            None => {
+                // Rebuild the per-scope analysis results from the AST. This reuses the Salsa
+                // ingredients stored on `self` instead of creating new ones, so it is safe to
+                // run within whichever query happened to call `load`.
+                let module = parsed_module(db, self.file).load(db);
+                let inner =
+                    Arc::new(SemanticIndexBuilder::for_rebuild(db, self, &module).build_inner());
+                tracing::debug!(
+                    "Semantic index for `{}` was rebuilt after being collected in the current Salsa revision",
+                    self.file.path(db)
+                );
+
+                self.inner.store(Some(inner.clone()));
+                inner
+            }
+        };
+
+        SemanticIndexRef { index: self, inner }
+    }
+
+    /// Clears the per-scope analysis results, dropping them once all [`SemanticIndexRef`]s to
+    /// them are dropped. The data is lazily rebuilt on the next [`SemanticIndex::load`].
+    pub fn clear(&self) {
+        self.inner.store(None);
+    }
+
+    /// Returns the file for which this semantic index was built.
+    pub fn file(&self) -> File {
+        self.file
     }
 
     /// Returns alias metadata for an alias Name node in a predicate, if one exists.
@@ -346,15 +598,6 @@ impl<'db> SemanticIndex<'db> {
         self.narrowing_alias_predicates.get(&key.into())
     }
 
-    /// Returns the use-def map for a specific scope.
-    ///
-    /// Use the Salsa cached [`use_def_map()`] query if you only need the
-    /// use-def map for a single scope.
-    #[track_caller]
-    pub fn use_def_map(&self, scope_id: FileScopeId) -> &UseDefMap<'db> {
-        &self.use_def_maps[scope_id]
-    }
-
     /// Returns the set of modules that are imported anywhere in this file.
     ///
     /// This set only considers `import` statements, not `from...import` statements.
@@ -362,11 +605,6 @@ impl<'db> SemanticIndex<'db> {
     /// of why this analysis is intentionally limited.
     pub fn imported_modules(&self) -> &FxHashSet<ModuleName> {
         &self.imported_modules
-    }
-
-    #[track_caller]
-    pub(crate) fn ast_ids(&self, scope_id: FileScopeId) -> &AstIds {
-        &self.ast_ids[scope_id]
     }
 
     /// Returns the ID of the `expression`'s enclosing scope.
@@ -402,14 +640,6 @@ impl<'db> SemanticIndex<'db> {
 
     pub fn scope_ids(&self) -> impl Iterator<Item = ScopeId<'db>> + '_ {
         self.scope_ids_by_scope.iter().copied()
-    }
-
-    pub fn symbol_is_global_in_scope(&self, symbol: ScopedSymbolId, scope: FileScopeId) -> bool {
-        self.place_table(scope).symbol(symbol).is_global()
-    }
-
-    pub fn symbol_is_nonlocal_in_scope(&self, symbol: ScopedSymbolId, scope: FileScopeId) -> bool {
-        self.place_table(scope).symbol(symbol).is_nonlocal()
     }
 
     /// Returns the id of the parent scope.
@@ -480,13 +710,6 @@ impl<'db> SemanticIndex<'db> {
             .into_iter()
             .flatten()
             .copied()
-    }
-
-    pub fn is_in_type_checking_block(&self, scope_id: FileScopeId, range: TextRange) -> bool {
-        self.ancestor_scopes(scope_id).any(|(scope_id, _)| {
-            self.use_def_map(scope_id)
-                .is_range_in_type_checking_block(range)
-        })
     }
 
     /// Returns an iterator over the descendent scopes of `scope`.
@@ -634,56 +857,6 @@ impl<'db> SemanticIndex<'db> {
     /// the logic for type inference.
     pub fn has_future_annotations(&self) -> bool {
         self.has_future_annotations
-    }
-
-    /// Returns
-    /// * `NoLongerInEagerContext` if the nested scope is no longer in an eager context
-    ///   (that is, not every scope that will be traversed is eager) and no lazy snapshots were found.
-    /// *  an iterator of bindings for a particular nested scope reference if the bindings exist.
-    /// *  a narrowing constraint if there are no bindings, but there is a narrowing constraint for an enclosing scope place.
-    /// * `NotFound` if the narrowing constraint / bindings do not exist in the nested scope.
-    pub fn enclosing_snapshot(
-        &self,
-        enclosing_scope: FileScopeId,
-        expr: PlaceExprRef,
-        nested_scope: FileScopeId,
-    ) -> EnclosingSnapshotResult<'_, 'db> {
-        for (ancestor_scope_id, ancestor_scope) in self.ancestor_scopes(nested_scope) {
-            if ancestor_scope_id == enclosing_scope {
-                break;
-            }
-            if !ancestor_scope.is_eager() {
-                if let PlaceExprRef::Symbol(symbol) = expr
-                    && let Some(place_id) =
-                        self.place_tables[enclosing_scope].symbol_id(symbol.name())
-                {
-                    let key = EnclosingSnapshotKey {
-                        enclosing_scope,
-                        enclosing_place: place_id.into(),
-                        nested_scope,
-                        nested_laziness: ScopeLaziness::Lazy,
-                    };
-                    if let Some(id) = self.enclosing_snapshots.get(&key) {
-                        return self.use_def_maps[enclosing_scope]
-                            .enclosing_snapshot(*id, key.nested_laziness);
-                    }
-                }
-                return EnclosingSnapshotResult::NoLongerInEagerContext;
-            }
-        }
-        let Some(place_id) = self.place_tables[enclosing_scope].place_id(expr) else {
-            return EnclosingSnapshotResult::NotFound;
-        };
-        let key = EnclosingSnapshotKey {
-            enclosing_scope,
-            enclosing_place: place_id,
-            nested_scope,
-            nested_laziness: ScopeLaziness::Eager,
-        };
-        let Some(id) = self.enclosing_snapshots.get(&key) else {
-            return EnclosingSnapshotResult::NotFound;
-        };
-        self.use_def_maps[enclosing_scope].enclosing_snapshot(*id, key.nested_laziness)
     }
 
     pub fn semantic_syntax_errors(&self) -> &[SemanticSyntaxError] {
@@ -1198,7 +1371,7 @@ y = 2
         assert_eq!(names(global_table), vec!["C", "y"]);
 
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
 
         let [(class_scope_id, class_scope)] = index
             .child_scopes(FileScopeId::global())
@@ -1232,7 +1405,7 @@ y = 2
 ",
         );
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["func", "y"]);
@@ -1268,7 +1441,7 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
 ",
         );
 
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = place_table(&db, global_scope(&db, file));
 
         assert_eq!(names(global_table), vec!["str", "int", "f"]);
@@ -1313,7 +1486,7 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
     fn lambda_parameter_symbols() {
         let TestCase { db, file } = test_case("lambda a, b, c=1, *args, d=2, **kwargs: None");
 
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = place_table(&db, global_scope(&db, file));
 
         assert!(names(global_table).is_empty());
@@ -1380,7 +1553,7 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
         );
 
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["iter1"]);
@@ -1430,7 +1603,7 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
 ",
         );
 
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let [(comprehension_scope_id, _)] = index
             .child_scopes(FileScopeId::global())
             .collect::<Vec<_>>()[..]
@@ -1477,7 +1650,7 @@ def f(a: str, /, b: str, c: int = 1, *args, d: int = 2, **kwargs):
         );
 
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["iter1"]);
@@ -1530,7 +1703,7 @@ with item1 as x, item2 as y:
 ",
         );
 
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["item1", "x", "item2", "y"]);
@@ -1553,7 +1726,7 @@ with context() as (x, y):
 ",
         );
 
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["context", "x", "y"]);
@@ -1578,7 +1751,7 @@ def func():
 ",
         );
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["func"]);
@@ -1626,7 +1799,7 @@ def func[T]():
         );
 
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["func"]);
@@ -1670,7 +1843,7 @@ class C[T]:
         );
 
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let global_table = index.place_table(FileScopeId::global());
 
         assert_eq!(names(global_table), vec!["C"]);
@@ -1742,7 +1915,7 @@ class C[T]:
     fn expression_scope() {
         let TestCase { db, file } = test_case("x = 1;\ndef test():\n  y = 4");
 
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
         let module = parsed_module(&db, file).load(&db);
         let ast = module.syntax();
 
@@ -1787,7 +1960,7 @@ def x():
         );
 
         let module = parsed_module(&db, file).load(&db);
-        let index = semantic_index(&db, file);
+        let index = semantic_index(&db, file).load(&db);
 
         let descendants = index.descendent_scopes(FileScopeId::global());
         assert_eq!(
@@ -1950,5 +2123,130 @@ match 1:
             .unwrap();
 
         assert!(matches!(binding.kind(&db), DefinitionKind::For(_)));
+    }
+
+    #[test]
+    fn load_without_clear_reuses_same_instance() {
+        let TestCase { db, file } = test_case("x = 1");
+
+        let index = semantic_index(&db, file);
+        let first = index.load(&db);
+        let second = index.load(&db);
+
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+    }
+
+    /// Clearing the semantic index and loading it again must rebuild data that's *identical*
+    /// to the initial build: cached query results refer into it by scoped IDs and by the
+    /// Salsa ingredients (`Definition`s, predicate `Expression`s, ...) it contains.
+    ///
+    /// The test source exercises all the builder paths that create Salsa ingredients:
+    /// definitions (including multi-definition nodes like `*` imports and loop headers),
+    /// standalone expressions and statements, unpackings, `match` patterns, narrowing
+    /// aliases, and star-import placeholder predicates.
+    #[test]
+    fn clear_and_reload_rebuilds_identical_index() {
+        const EXPORTER: &str = "
+import sys
+
+if sys.version_info >= (3, 11):
+    class A: ...
+
+b = 2
+
+def c(): ...
+";
+
+        const MAIN: &str = r#"
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import os
+
+A = 1
+from exporter import *
+
+x = 1
+is_small = x < 10
+
+if is_small and x != 2:
+    y = [val for (val, _other) in [(1, 2)]]
+else:
+    y = []
+    y.append(x)
+
+assert x != 0, "x should not be zero"
+
+(p, q) = (1, 2)
+
+for i, j in [(1, 2)]:
+    if i > 1:
+        continue
+    break
+else:
+    pass
+
+while x < 3:
+    x += 1
+
+def f(arg: int, *args, **kwargs):
+    global x
+    items = []
+    items.append(arg)
+    fn = lambda z: z + arg
+    match arg:
+        case 1 | 2:
+            pass
+        case [first, *rest] if first > 0:
+            pass
+        case {"k": v}:
+            pass
+        case SomeClass(attr=val):
+            pass
+        case other:
+            pass
+    with open("file") as (fh, _fh):
+        pass
+    try:
+        return items
+    except ValueError as exc:
+        raise
+
+class C:
+    attr: int = 1
+
+    def method(self):
+        self.instance_attr = x
+        yield self.instance_attr
+
+def outer():
+    a = 1
+
+    def inner():
+        nonlocal a
+        a = 2
+
+    return inner
+"#;
+
+        let db = TestDbBuilder::new()
+            .with_file("/src/exporter.py", EXPORTER)
+            .with_file("/src/main.py", MAIN)
+            .build()
+            .unwrap();
+        let file = system_path_to_file(&db, "/src/main.py").unwrap();
+
+        let index = semantic_index(&db, file);
+        let before = index.load(&db);
+
+        index.clear();
+        let after = index.load(&db);
+
+        // The rebuild created a new instance of the data ...
+        assert!(!Arc::ptr_eq(&before.inner, &after.inner));
+
+        // ... that is identical to the data of the initial build, including all the Salsa
+        // ingredients referenced from the use-def maps.
+        assert_eq!(*before.inner, *after.inner);
     }
 }

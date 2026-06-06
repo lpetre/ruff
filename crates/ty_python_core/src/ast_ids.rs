@@ -25,7 +25,7 @@ pub use node_key::ExpressionNodeKey;
 ///
 /// x = foo()
 /// ```
-#[derive(Debug, salsa::Update, get_size2::GetSize)]
+#[derive(Debug, PartialEq, Eq, salsa::Update, get_size2::GetSize)]
 pub(crate) struct AstIds {
     /// Maps expressions which "use" a place (that is, [`ast::ExprName`], [`ast::ExprAttribute`] or [`ast::ExprSubscript`]) to a use id.
     uses_map: FxHashMap<ExpressionNodeKey, ScopedUseId>,
@@ -37,8 +37,9 @@ impl AstIds {
     }
 }
 
-fn ast_ids<'db>(db: &'db dyn Db, scope: ScopeId) -> &'db AstIds {
-    semantic_index(db, scope.file(db)).ast_ids(scope.file_scope_id(db))
+fn use_id(db: &dyn Db, scope: ScopeId, key: impl Into<ExpressionNodeKey>) -> ScopedUseId {
+    let index = semantic_index(db, scope.file(db)).load(db);
+    index.ast_ids(scope.file_scope_id(db)).use_id(key)
 }
 
 /// Uniquely identifies a use of a name in a [`crate::FileScopeId`].
@@ -53,8 +54,7 @@ pub trait HasScopedUseId {
 
 impl HasScopedUseId for ast::Identifier {
     fn scoped_use_id(&self, db: &dyn Db, scope: ScopeId) -> ScopedUseId {
-        let ast_ids = ast_ids(db, scope);
-        ast_ids.use_id(self)
+        use_id(db, scope, self)
     }
 }
 
@@ -81,15 +81,13 @@ impl HasScopedUseId for ast::ExprSubscript {
 
 impl HasScopedUseId for ast::Keyword {
     fn scoped_use_id(&self, db: &dyn Db, scope: ScopeId) -> ScopedUseId {
-        let ast_ids = ast_ids(db, scope);
-        ast_ids.use_id(self)
+        use_id(db, scope, self)
     }
 }
 
 impl HasScopedUseId for ast::ExprRef<'_> {
     fn scoped_use_id(&self, db: &dyn Db, scope: ScopeId) -> ScopedUseId {
-        let ast_ids = ast_ids(db, scope);
-        ast_ids.use_id(*self)
+        use_id(db, scope, *self)
     }
 }
 
