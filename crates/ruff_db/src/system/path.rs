@@ -69,6 +69,44 @@ impl SystemPath {
         self.0.is_absolute()
     }
 
+    /// Returns `true` if the path is absolute *and* already normalized
+    /// (no `.`/`..` components, no repeated separators, no trailing separator).
+    ///
+    /// This is used as a fast path in [`SystemPath::absolute`] to skip the
+    /// per-component rebuild when no normalization work is needed. On Windows
+    /// the check is always `false` because reliably detecting the various
+    /// prefix forms is more involved and not the bottleneck this targets.
+    #[cfg(unix)]
+    fn is_normalized_absolute(&self) -> bool {
+        let bytes = self.as_str().as_bytes();
+        // Must start with '/'.
+        if bytes.first() != Some(&b'/') {
+            return false;
+        }
+        // Skip the leading '/'. "/" alone is normalized and absolute.
+        let rest = &bytes[1..];
+        if rest.is_empty() {
+            return true;
+        }
+        // A trailing '/' would be normalized away, so the rebuilt path
+        // wouldn't be byte-equal to the input.
+        if rest.last() == Some(&b'/') {
+            return false;
+        }
+        // Each segment between separators must be non-empty and not `.`/`..`.
+        for segment in rest.split(|&b| b == b'/') {
+            if segment.is_empty() || segment == b"." || segment == b".." {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(not(unix))]
+    fn is_normalized_absolute(&self) -> bool {
+        false
+    }
+
     /// Extracts the file extension, if possible.
     ///
     /// The extension is:
@@ -446,6 +484,12 @@ impl SystemPath {
     /// ```
     pub fn absolute(path: impl AsRef<SystemPath>, cwd: impl AsRef<SystemPath>) -> SystemPathBuf {
         fn absolute(path: &SystemPath, cwd: &SystemPath) -> SystemPathBuf {
+            // Fast path: if the input is already absolute and normalized, we can
+            // avoid the per-component rebuild and just clone the buffer.
+            if path.is_normalized_absolute() {
+                return path.to_path_buf();
+            }
+
             let path = &path.0;
 
             let mut components = path.components().peekable();
@@ -927,5 +971,54 @@ where
         }
 
         Some(current)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::SystemPath;
+
+    #[test]
+    fn normalized_absolute_paths() {
+        assert!(SystemPath::new("/").is_normalized_absolute());
+        assert!(SystemPath::new("/foo").is_normalized_absolute());
+        assert!(SystemPath::new("/foo/bar").is_normalized_absolute());
+        assert!(SystemPath::new("/foo/bar/baz.txt").is_normalized_absolute());
+    }
+
+    #[test]
+    fn not_normalized_absolute_paths() {
+        // Relative
+        assert!(!SystemPath::new("").is_normalized_absolute());
+        assert!(!SystemPath::new("foo").is_normalized_absolute());
+        assert!(!SystemPath::new("foo/bar").is_normalized_absolute());
+        assert!(!SystemPath::new("./foo").is_normalized_absolute());
+        // Cur/parent dir components
+        assert!(!SystemPath::new("/foo/.").is_normalized_absolute());
+        assert!(!SystemPath::new("/./foo").is_normalized_absolute());
+        assert!(!SystemPath::new("/foo/..").is_normalized_absolute());
+        assert!(!SystemPath::new("/foo/../bar").is_normalized_absolute());
+        // Repeated separators
+        assert!(!SystemPath::new("//foo").is_normalized_absolute());
+        assert!(!SystemPath::new("/foo//bar").is_normalized_absolute());
+        // Trailing separator
+        assert!(!SystemPath::new("/foo/").is_normalized_absolute());
+        assert!(!SystemPath::new("/foo/bar/").is_normalized_absolute());
+    }
+
+    #[test]
+    fn absolute_fast_path_matches_slow_path() {
+        // When the input is already normalized and absolute, the fast path
+        // must produce a byte-identical result to the rebuild loop.
+        for input in [
+            "/",
+            "/foo",
+            "/foo/bar",
+            "/foo/bar/baz.txt",
+            "/a/b/c/d/e/f/g/h/i/j",
+        ] {
+            let absolute = SystemPath::absolute(input, "/cwd");
+            assert_eq!(absolute.as_str(), input);
+        }
     }
 }
