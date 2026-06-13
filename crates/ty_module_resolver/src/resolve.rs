@@ -46,6 +46,7 @@ use ruff_python_ast::{
 };
 
 use crate::db::Db;
+use crate::list::{ascii_lowercase_cow, root_to_search_paths};
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
@@ -158,7 +159,7 @@ pub enum ModuleResolveMode {
 #[salsa::interned(heap_size=ruff_memory_usage::heap_size)]
 #[derive(Debug)]
 pub(crate) struct ModuleResolveModeIngredient<'db> {
-    mode: ModuleResolveMode,
+    pub(crate) mode: ModuleResolveMode,
 }
 
 impl ModuleResolveMode {
@@ -1064,8 +1065,17 @@ struct ModuleNameIngredient<'db> {
 /// Given a module name and a list of search paths in which to lookup modules,
 /// attempt to resolve the module name
 fn resolve_name(db: &dyn Db, name: &ModuleName, mode: ModuleResolveMode) -> Option<ResolvedNames> {
-    let search_paths = search_paths(db, mode);
-    resolve_name_impl(db, name, mode, search_paths)
+    // Narrow the candidate search paths by consulting the cached reverse
+    // index from `first-component-of-module-name` to search paths. The
+    // resolver still applies all the usual filters (case sensitivity,
+    // VERSIONS, non-shadowable, stub priority, …), but skipping search paths
+    // that obviously can't contain a top-level entry for this name avoids
+    // a lot of per-name work on workloads with many editable installs or
+    // site-packages directories.
+    let root = ascii_lowercase_cow(name.first_component());
+    let index = root_to_search_paths(db, ModuleResolveModeIngredient::new(db, mode));
+    let candidates = index.get(root.as_ref()).map(Vec::as_slice).unwrap_or(&[]);
+    resolve_name_impl(db, name, mode, candidates.iter())
 }
 
 /// Like `resolve_name` but for cases where it failed to resolve the module
@@ -1782,7 +1792,7 @@ mod tests {
     use ruff_db::Db;
     use ruff_db::files::{File, FilePath, system_path_to_file};
     use ruff_db::system::{DbWithTestSystem as _, DbWithWritableSystem as _};
-    use ruff_db::testing::assert_function_query_was_not_run;
+    use ruff_db::testing::{assert_function_query_was_not_run, assert_function_query_was_run};
     use ruff_python_ast::PythonVersion;
 
     use crate::db::tests::TestDb;
@@ -2390,8 +2400,11 @@ mod tests {
         db.memory_file_system().remove_file(&bar_path).unwrap();
         bar.sync(&mut db);
 
-        // Re-query the foo module. The foo module should still be cached
-        // because `bar.py` isn't relevant for resolving `foo`.
+        // Re-query the foo module. The resolution result must not change:
+        // `bar.py` isn't relevant for resolving `foo`. The cached value
+        // does get rebuilt because the reverse index keyed by top-level
+        // module-name component (`crate::list::root_to_search_paths`)
+        // loses its entry for `"bar"` when `bar.py` disappears.
 
         let foo_module2 = resolve_module_confident(&db, &foo_module_name);
         let foo_pieces2 = foo_module2.map(|foo_module2| {
@@ -2404,10 +2417,12 @@ mod tests {
             )
         });
 
-        assert!(
-            !db.take_salsa_events()
-                .iter()
-                .any(|event| { matches!(event.kind, salsa::EventKind::WillExecute { .. }) })
+        let events = db.take_salsa_events();
+        assert_function_query_was_run(
+            &db,
+            resolve_module_query,
+            ModuleNameIngredient::new(&db, foo_module_name, ModuleResolveMode::StubsAllowed),
+            &events,
         );
 
         assert_eq!(Some(foo_pieces), foo_pieces2);
@@ -2463,7 +2478,7 @@ mod tests {
     }
 
     #[test]
-    fn adding_file_to_search_path_with_lower_priority_does_not_invalidate_query() {
+    fn adding_file_to_search_path_with_lower_priority_invalidates_query() {
         const TYPESHED: MockedTypeshed = MockedTypeshed {
             versions: "functools: 3.8-",
             stdlib_files: &[("functools.pyi", "def update_wrapper(): ...")],
@@ -2489,8 +2504,11 @@ mod tests {
             system_path_to_file(&db, &stdlib_functools_path)
         );
 
-        // Adding a file to site-packages does not invalidate the query,
-        // since site-packages takes lower priority in the module resolution
+        // Adding a file to site-packages invalidates the query because the
+        // reverse index keyed by top-level module-name component (see
+        // `crate::list::root_to_search_paths`) gains a new candidate path
+        // under key `functools`. The resolution result is unchanged (the
+        // stdlib stub still wins on priority) but the cache is rebuilt.
         db.clear_salsa_events();
         let site_packages_functools_path = site_packages.join("functools.py");
         db.write_file(&site_packages_functools_path, "f: int")
@@ -2499,7 +2517,7 @@ mod tests {
         let functools_file = functools_module.file(&db).unwrap();
         let functools_search_path = functools_module.search_path(&db).unwrap().clone();
         let events = db.take_salsa_events();
-        assert_function_query_was_not_run(
+        assert_function_query_was_run(
             &db,
             resolve_module_query,
             ModuleNameIngredient::new(&db, functools_module_name, ModuleResolveMode::StubsAllowed),

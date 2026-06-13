@@ -1,12 +1,20 @@
+use std::borrow::Cow;
 use std::collections::btree_map::{BTreeMap, Entry};
 
+use rustc_hash::FxHashMap;
+
+use ruff_db::system::SystemPath;
 use ruff_python_ast::PythonVersion;
+use ruff_python_ast::name::Name;
 
 use crate::db::Db;
 use crate::module::{Module, ModuleKind};
 use crate::module_name::ModuleName;
 use crate::path::{ModulePath, SearchPath, SystemOrVendoredPathRef};
-use crate::resolve::{ModuleResolveMode, ResolverContext, resolve_file_module, search_paths};
+use crate::resolve::{
+    ModuleResolveMode, ModuleResolveModeIngredient, ResolverContext, resolve_file_module,
+    search_paths,
+};
 
 /// List all available modules, including all sub-modules, sorted in lexicographic order.
 pub fn all_modules(db: &dyn Db) -> Vec<Module<'_>> {
@@ -75,30 +83,181 @@ fn list_modules_in<'db>(
 ) -> Vec<ListedModule<'db>> {
     tracing::debug!("Listing modules in search path '{}'", search_path.path(db));
     let mut lister = Lister::new(db, search_path.path(db));
-    match search_path.path(db).as_path() {
+    for entry in top_level_entries_in(db, search_path) {
+        lister.add_entry(entry);
+    }
+    lister.into_modules()
+}
+
+/// A top-level directory entry in a search path.
+///
+/// This is the cached primitive that both [`list_modules_in`] and
+/// [`root_to_search_paths`] consume so that the directory is only scanned once
+/// per disk state.
+#[derive(Clone, Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
+pub(crate) struct TopLevelEntry {
+    /// The basename of the directory entry (no parent path components).
+    ///
+    /// Stored as a [`Name`] so short filenames (the common case for Python
+    /// packages) stay inline and don't hit the heap.
+    name: Name,
+    file_type: FileType,
+}
+
+/// Reads the top-level entries of a search path and caches them.
+///
+/// Registers an explicit dependency on the directory's revision (for system
+/// paths) so this query is invalidated when files are added or removed from
+/// the directory.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+fn top_level_entries_in<'db>(
+    db: &'db dyn Db,
+    search_path: SearchPathIngredient<'db>,
+) -> Vec<TopLevelEntry> {
+    let path = search_path.path(db);
+    match path.as_path() {
         SystemOrVendoredPathRef::System(system_search_path) => {
-            // Read the revision on the corresponding file root to
-            // register an explicit dependency on this directory. When
-            // the revision gets bumped, the cache that Salsa creates
-            // for this routine will be invalidated.
-            let root = db.files().expect_root(db, system_search_path);
-            let _ = root.revision(db);
+            // Register a revision dependency on this directory so Salsa
+            // invalidates the cache when files are added or removed. In
+            // production, every search path is registered as a root by
+            // either `SearchPaths::try_register_static_roots`, the
+            // project setup, or the `.pth`-file walker — see resolve.rs.
+            // Direct uses of `TestDb` that bypass those code paths simply
+            // skip the dependency; that's only correct for snapshot-style
+            // tests that don't mutate the filesystem.
+            if let Some(root) = db.files().root(db, system_search_path) {
+                let _ = root.revision(db);
+            }
 
             let Ok(it) = db.system().read_directory(system_search_path) else {
                 return vec![];
             };
+            let mut entries = Vec::new();
             for result in it {
                 let Ok(entry) = result else { continue };
-                lister.add_path(&entry.path().into(), entry.file_type().into());
+                let Some(name) = entry.path().file_name() else {
+                    continue;
+                };
+                entries.push(TopLevelEntry {
+                    name: Name::new(name),
+                    file_type: entry.file_type().into(),
+                });
             }
+            entries
         }
-        SystemOrVendoredPathRef::Vendored(vendored_search_path) => {
-            for entry in db.vendored().read_directory(vendored_search_path) {
-                lister.add_path(&entry.path().into(), entry.file_type().into());
+        SystemOrVendoredPathRef::Vendored(vendored_search_path) => db
+            .vendored()
+            .read_directory(vendored_search_path)
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry.path().file_name()?;
+                Some(TopLevelEntry {
+                    name: Name::new(name),
+                    file_type: entry.file_type().into(),
+                })
+            })
+            .collect(),
+    }
+}
+
+/// A reverse index from the lowercased first component of a module name to the
+/// search paths that *might* contain a top-level module with that name.
+///
+/// This is built once per `(disk state, ModuleResolveMode)` and consulted by
+/// `resolve_name` so it can skip search paths that obviously can't contribute
+/// the module being resolved.
+///
+/// The map is purely advisory: false positives are corrected downstream by the
+/// existing resolver (case-sensitive lookup, VERSIONS gating for stdlib, the
+/// non-shadowable-module rule, etc.). The point is to avoid doing per-name
+/// work in unrelated search paths.
+///
+/// Keys are ASCII-lowercased so the index naturally handles case-insensitive
+/// filesystems. Directory entries named `foo-stubs` are recorded under key
+/// `foo` so stub-package lookups hit the same key as the runtime package.
+///
+/// `Vec<SearchPath>` values preserve the original iteration order from
+/// [`search_paths`], so callers can pass them directly to `resolve_name_impl`
+/// without losing search-path priority.
+#[salsa::tracked(returns(ref), heap_size=ruff_memory_usage::heap_size)]
+pub(crate) fn root_to_search_paths<'db>(
+    db: &'db dyn Db,
+    mode: ModuleResolveModeIngredient<'db>,
+) -> FxHashMap<Name, Vec<SearchPath>> {
+    let mut map: FxHashMap<Name, Vec<SearchPath>> = FxHashMap::default();
+    for search_path in search_paths(db, mode.mode(db)) {
+        let ingredient = SearchPathIngredient::new(db, search_path.clone());
+        for entry in top_level_entries_in(db, ingredient) {
+            let Some(root) = entry_to_root_component(entry) else {
+                continue;
+            };
+            // A single search path may contain both `foo.py` and `foo/` (or
+            // `foo-stubs/`). While we're iterating one search path, every
+            // push goes to that same search path, so any bucket whose last
+            // element is the current search path already has it.
+            let bucket = map.entry(root).or_default();
+            if bucket.last() != Some(search_path) {
+                bucket.push(search_path.clone());
             }
         }
     }
-    lister.into_modules()
+    map
+}
+
+/// Returns the lowercased canonical root-component name that the given
+/// top-level directory entry contributes to, or `None` if this entry can't
+/// participate in any top-level Python module name.
+///
+/// Stub packages (`foo-stubs/`) collapse to the underlying name (`foo`) so
+/// resolver narrowing finds the stub-package candidate under the same key as
+/// the runtime package.
+///
+/// File type is intentionally ignored beyond extension filtering: symlinks
+/// can point at either files (e.g. `bar.py -> foo.py`) or directories, and
+/// the index can't distinguish them without hitting the filesystem. Mirroring
+/// the filter in `Lister::add_entry` (drop entries with non-Python
+/// extensions) covers both cases correctly.
+fn entry_to_root_component(entry: &TopLevelEntry) -> Option<Name> {
+    let name_path = SystemPath::new(entry.name.as_str());
+
+    if let Some(ext) = name_path.extension()
+        && !is_python_extension(ext)
+    {
+        return None;
+    }
+
+    let stem = name_path.file_stem()?;
+
+    if stem.is_empty() || stem.starts_with('.') {
+        return None;
+    }
+
+    // `__init__` is never a top-level module name.
+    if stem == "__init__" {
+        return None;
+    }
+
+    let canonical = stem.strip_suffix("-stubs").unwrap_or(stem);
+    if canonical.is_empty() {
+        return None;
+    }
+
+    Some(Name::new(ascii_lowercase_cow(canonical)))
+}
+
+/// ASCII-lowercases `s`, returning a borrowed slice when it's already
+/// lowercase (the common case for Python package names). The resolver's
+/// index key and the resolver's lookup key MUST go through the same
+/// normalization — `resolve_name` (in `resolve.rs`) calls this on the
+/// first component of a module name to look up keys this function
+/// installed.
+#[inline]
+pub(crate) fn ascii_lowercase_cow(s: &str) -> Cow<'_, str> {
+    if s.bytes().any(|b| b.is_ascii_uppercase()) {
+        Cow::Owned(s.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 /// A module paired with whether it came from a stub package.
@@ -139,28 +298,26 @@ impl<'db> Lister<'db> {
         self.modules.into_values().collect()
     }
 
-    /// Add the given `path` as a possible module to this lister. The
-    /// `file_type` should be the type of `path` (file, directory or
-    /// symlink).
+    /// Add the given directory entry as a possible module to this lister.
     ///
-    /// This may decide that the given path does not correspond to
-    /// a valid Python module. In which case, it is dropped and this
-    /// is a no-op.
+    /// This may decide that the given entry does not correspond to a valid
+    /// Python module. In which case, it is dropped and this is a no-op.
     ///
-    /// Callers must ensure that the path given came from the same
-    /// `SearchPath` used to create this `Lister`.
-    fn add_path(&mut self, path: &SystemOrVendoredPathRef<'_>, file_type: FileType) {
+    /// Callers must ensure that the entry came from the same `SearchPath`
+    /// used to create this `Lister`.
+    fn add_entry(&mut self, entry: &TopLevelEntry) {
+        let TopLevelEntry { name, file_type } = entry;
+        let name = name.as_str();
         let mut has_py_extension = false;
         // We must have no extension, a Python source file extension (`.py`)
         // or a Python stub file extension (`.pyi`).
-        if let Some(ext) = path.extension() {
+        if let Some(ext) = SystemPath::new(name).extension() {
             has_py_extension = is_python_extension(ext);
             if !has_py_extension {
                 return;
             }
         }
 
-        let Some(name) = path.file_name() else { return };
         let mut module_path = self.search_path.to_module_path();
         module_path.push(name);
         let Some(module_name) = module_path.to_module_name() else {
@@ -347,7 +504,7 @@ impl<'db> Lister<'db> {
 }
 
 /// The type of a file.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, salsa::Update, get_size2::GetSize)]
 enum FileType {
     File,
     Directory,
@@ -412,7 +569,7 @@ mod tests {
     use crate::strategy::FallibleStrategy;
     use crate::testing::{FileSpec, MockedTypeshed, TestCase, TestCaseBuilder};
 
-    use super::list_modules;
+    use super::{list_modules, root_to_search_paths};
 
     struct ModuleDebugSnapshot<'db> {
         db: &'db dyn Db,
@@ -1387,6 +1544,12 @@ not_a_directory
         assert_function_query_was_not_run(
             &db,
             dynamic_resolution_paths,
+            ModuleResolveModeIngredient::new(&db, ModuleResolveMode::StubsAllowed),
+            &events,
+        );
+        assert_function_query_was_not_run(
+            &db,
+            root_to_search_paths,
             ModuleResolveModeIngredient::new(&db, ModuleResolveMode::StubsAllowed),
             &events,
         );

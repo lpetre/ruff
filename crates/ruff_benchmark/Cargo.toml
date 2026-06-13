@@ -22,6 +22,7 @@ ruff_linter = { workspace = true, optional = true }
 ruff_python_formatter = { workspace = true, optional = true }
 ruff_python_parser = { workspace = true, optional = true }
 ruff_python_trivia = { workspace = true, optional = true }
+ty_module_resolver = { workspace = true, optional = true }
 ty_project = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
@@ -56,7 +57,7 @@ ruff_instrumented = [
     "tikv-jemallocator",
 ]
 # Enables the ty instrumented benchmarks
-ty_instrumented = ["criterion", "ty_project", "ruff_python_trivia"]
+ty_instrumented = ["criterion", "ty_module_resolver", "ty_project", "ruff_python_trivia"]
 codspeed = ["codspeed-criterion-compat"]
 # Enables the ty_walltime benchmarks
 ty_walltime = ["ruff_db/os", "ty_project", "divan"]
@@ -83,6 +84,11 @@ required-features = ["ruff_instrumented"]
 
 [[bench]]
 name = "ty"
+harness = false
+required-features = ["ty_instrumented"]
+
+[[bench]]
+name = "module_resolution"
 harness = false
 required-features = ["ty_instrumented"]
 
