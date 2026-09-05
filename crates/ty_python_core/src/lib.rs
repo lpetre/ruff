@@ -6,6 +6,7 @@ use ruff_python_ast as ast;
 use std::iter::{FusedIterator, once};
 use std::sync::Arc;
 
+use arc_swap::ArcSwapOption;
 use ruff_db::parsed::parsed_module;
 
 use ruff_index::{FrozenIndexVec, IndexSlice};
@@ -23,6 +24,7 @@ pub use crate::statement::{Statement, StatementNodeKey};
 use ast_ids::AstIds;
 pub use ast_ids::ExpressionNodeKey;
 use builder::SemanticIndexBuilder;
+pub(crate) use builder::SemanticIndexIngredients;
 use definition::{Definition, DefinitionNodeKey, Definitions};
 use expression::Expression;
 use narrowing_constraints::ScopedNarrowingConstraint;
@@ -69,14 +71,148 @@ pub use program_file::ProgramFile;
 
 /// Returns the semantic index for `file`.
 ///
-/// Prefer using [`symbol_table`] when working with symbols from a single scope.
+/// The index is loaded from the [`SemanticIndexHandle`] returned by [`semantic_index_handle`]:
+/// it is rebuilt from the AST if it was released with [`SemanticIndexHandle::clear`]. Holding on
+/// to the returned [`SemanticIndexRef`] keeps the index alive across such a `clear`.
+///
+/// Prefer using [`place_table`] when working with places from a single scope.
+pub fn semantic_index<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> SemanticIndexRef<'db> {
+    semantic_index_handle(db, file).load(db)
+}
+
+/// Returns the semantic index handle for `file`.
+///
+/// Building the index is the query; the handle it returns owns the index behind a cell that
+/// [`SemanticIndexHandle::clear`] can empty to reduce memory usage. Use [`semantic_index`] to
+/// access the index itself.
 #[salsa::tracked(returns(ref), no_eq, heap_size=ruff_memory_usage::heap_size)]
-pub fn semantic_index<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> SemanticIndex<'db> {
+pub fn semantic_index_handle<'db>(
+    db: &'db dyn Db,
+    file: ProgramFile<'db>,
+) -> SemanticIndexHandle<'db> {
     let _span = tracing::trace_span!("semantic_index", ?file).entered();
 
     let module = parsed_module(db, file.python_file(db)).load(db);
 
     SemanticIndexBuilder::new(db, file, &module).build()
+}
+
+/// Owner of a file's [`SemanticIndex`], returned by the [`semantic_index_handle`] query.
+///
+/// Similar to [`ruff_db::parsed::ParsedModule`], the index itself lives in a cell that can be
+/// emptied with [`SemanticIndexHandle::clear`] to reduce memory usage and is lazily rebuilt from
+/// the AST the next time [`semantic_index`] loads it.
+///
+/// Unlike an AST, the index contains Salsa ingredients ([`Definition`], [`Expression`],
+/// [`ScopeId`], ...) that can only be created while the [`semantic_index_handle`] query executes.
+/// The handle therefore retains every ingredient the initial build created, in creation order,
+/// and a rebuild (which runs inside whichever query happened to call `load`) hands them out again
+/// in that same order instead of creating new ones. Because the builder's walk over the AST is
+/// deterministic, the rebuilt index is identical to the one produced by the initial build.
+#[derive(Debug, get_size2::GetSize)]
+pub struct SemanticIndexHandle<'db> {
+    /// The file for which the index was built.
+    file: ProgramFile<'db>,
+
+    /// Every Salsa ingredient created by the initial build, in creation order.
+    ingredients: SemanticIndexIngredients<'db>,
+
+    /// The index. `None` after [`SemanticIndexHandle::clear`] until the next load through
+    /// [`semantic_index`] rebuilds it.
+    #[get_size(size_fn = arc_swap_size)]
+    index: ArcSwapOption<SemanticIndex<'db>>,
+}
+
+impl<'db> SemanticIndexHandle<'db> {
+    fn new(
+        file: ProgramFile<'db>,
+        ingredients: SemanticIndexIngredients<'db>,
+        index: SemanticIndex<'db>,
+    ) -> Self {
+        Self {
+            file,
+            ingredients,
+            index: ArcSwapOption::from_pointee(index),
+        }
+    }
+
+    /// Loads the index, rebuilding it from the AST if it was released by
+    /// [`SemanticIndexHandle::clear`].
+    ///
+    /// Holding on to the returned reference keeps the index alive across a later `clear`.
+    fn load(&'db self, db: &'db dyn Db) -> SemanticIndexRef<'db> {
+        let index = match self.index.load_full() {
+            Some(index) => index,
+            None => {
+                let module = parsed_module(db, self.file.python_file(db)).load(db);
+                let index = Arc::new(
+                    SemanticIndexBuilder::for_rebuild(db, self.file, &self.ingredients, &module)
+                        .rebuild(),
+                );
+                tracing::debug!(
+                    "Semantic index for `{}` was rebuilt after being released in the current Salsa revision",
+                    self.file.file(db).path(db)
+                );
+
+                self.index.store(Some(Arc::clone(&index)));
+                index
+            }
+        };
+
+        SemanticIndexRef { index }
+    }
+
+    /// Releases the index. It is dropped once every [`SemanticIndexRef`] to it is dropped and
+    /// lazily rebuilt the next time [`semantic_index`] loads it.
+    pub fn clear(&self) {
+        self.index.store(None);
+    }
+
+    /// Returns the [`ScopeId`] ingredient of a scope without loading the index.
+    fn scope_id(&self, scope: FileScopeId) -> ScopeId<'db> {
+        self.ingredients.scope_id(scope)
+    }
+}
+
+/// # Safety
+///
+/// Every field is a Salsa ingredient, a collection of Salsa ingredients, or an `Arc` around the
+/// [`SemanticIndex`], which is a `SalsaValue` itself. The handle carries no `'db` reference, so
+/// it is as safe to retain across revisions as the index it owns.
+#[expect(unsafe_code)]
+unsafe impl salsa::SalsaValue for SemanticIndexHandle<'_> {}
+
+/// Returns the heap size of the value currently stored in the `ArcSwapOption`, if any.
+fn arc_swap_size<T>(arc_swap: &ArcSwapOption<T>) -> usize
+where
+    T: get_size2::GetSize,
+{
+    arc_swap
+        .load()
+        .as_ref()
+        .map_or(0, |value| T::get_heap_size(value))
+}
+
+/// A cheap, cloneable reference to a loaded [`SemanticIndex`].
+///
+/// Holding on to it prevents [`SemanticIndexHandle::clear`] from freeing the index.
+#[derive(Clone)]
+pub struct SemanticIndexRef<'db> {
+    index: Arc<SemanticIndex<'db>>,
+}
+
+impl<'db> std::ops::Deref for SemanticIndexRef<'db> {
+    type Target = SemanticIndex<'db>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.index
+    }
+}
+
+impl std::fmt::Debug for SemanticIndexRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.index, f)
+    }
 }
 
 /// Returns the place table for a specific `scope`.
@@ -177,8 +313,10 @@ pub fn attribute_scopes<'db>(
     class_body_scope: ScopeId<'db>,
 ) -> impl Iterator<Item = FileScopeId> + 'db {
     let index = semantic_index(db, class_body_scope.program_file(db));
+    let index = &*index;
     let class_scope_id = class_body_scope.file_scope_id(db);
-    ChildrenIter::new(&index.scopes, class_scope_id)
+    // Collected eagerly: the returned iterator must not borrow the loaded index.
+    let scopes: Vec<FileScopeId> = ChildrenIter::new(&index.scopes, class_scope_id)
         .filter_map(move |(child_scope_id, scope)| {
             let (function_scope_id, function_scope) =
                 if scope.node().scope_kind() == ScopeKind::TypeParams {
@@ -221,6 +359,8 @@ pub fn attribute_scopes<'db>(
             });
             once(func_id).chain(nested)
         })
+        .collect();
+    scopes.into_iter()
 }
 
 /// Returns the module global scope of `file`.
@@ -2079,5 +2219,146 @@ match 1:
             .unwrap();
 
         assert_matches!(binding.kind(&db), DefinitionKind::For(_));
+    }
+
+    #[test]
+    fn load_without_clear_returns_the_same_index() {
+        let TestCase { db, file } = test_case("x = 1");
+        let file = db.program().program_file(&db, file);
+
+        let handle = semantic_index_handle(&db, file);
+        let first = handle.load(&db);
+        let second = handle.load(&db);
+
+        assert!(Arc::ptr_eq(&first.index, &second.index));
+    }
+
+    /// Clearing the semantic index and loading it again must rebuild an index that is
+    /// *identical* to the initial build: cached query results refer into it by scoped IDs and by
+    /// the Salsa ingredients (`Definition`s, predicate `Expression`s, ...) it contains.
+    ///
+    /// The test source exercises all the builder paths that create Salsa ingredients:
+    /// definitions (including the loop-header and nested-binding definitions that aren't keyed
+    /// by an AST node), standalone expressions and statements, unpackings, `match` patterns,
+    /// narrowing aliases, and star-import placeholder predicates.
+    #[test]
+    fn clear_and_reload_rebuilds_identical_index() {
+        const EXPORTER: &str = "
+import sys
+
+if sys.version_info >= (3, 11):
+    class A: ...
+
+b = 2
+
+def c(): ...
+";
+
+        const MAIN: &str = r#"
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import os
+
+A = 1
+from exporter import *
+
+x = 1
+is_small = x < 10
+
+if is_small and x != 2:
+    y = [val for (val, _other) in [(1, 2)]]
+else:
+    y = []
+    y.append(x)
+
+assert x != 0, "x should not be zero"
+
+(p, q) = (1, 2)
+
+for i, j in [(1, 2)]:
+    if i > 1:
+        continue
+    break
+else:
+    pass
+
+while x < 3:
+    x += 1
+
+def f(arg: int, *args, **kwargs):
+    global x
+    items = []
+    items.append(arg)
+    fn = lambda z: z + arg
+    match arg:
+        case 1 | 2:
+            pass
+        case [first, *rest] if first > 0:
+            pass
+        case {"k": v}:
+            pass
+        case SomeClass(attr=val):
+            pass
+        case other:
+            pass
+    with open("file") as (fh, _fh):
+        pass
+    try:
+        return items
+    except ValueError as exc:
+        raise
+
+class C:
+    attr: int = 1
+
+    def method(self):
+        self.instance_attr = x
+        yield self.instance_attr
+
+def outer():
+    a = 1
+
+    def inner():
+        nonlocal a
+        a = 2
+
+    return inner
+
+values = [(w := n) for n in range(3)]
+"#;
+
+        let db = TestDbBuilder::new()
+            .with_file("/src/exporter.py", EXPORTER)
+            .with_file("/src/main.py", MAIN)
+            .build()
+            .unwrap();
+        let file = system_path_to_file(&db, "/src/main.py").unwrap();
+        let file = db.program().program_file(&db, file);
+
+        let handle = semantic_index_handle(&db, file);
+        let before = handle.load(&db);
+
+        handle.clear();
+        let after = handle.load(&db);
+
+        // The rebuild created a new index ...
+        assert!(!Arc::ptr_eq(&before.index, &after.index));
+
+        // ... that is identical to the initial build, including every Salsa ingredient it refers
+        // to. The index has no `PartialEq` implementation; its `Debug` output is a faithful
+        // rendering of all of its fields, except that `bitvec` collections print their heap
+        // address, which naturally differs between the two builds.
+        let without_heap_addresses = |index: &SemanticIndex| {
+            format!("{index:#?}")
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("addr:"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(
+            without_heap_addresses(&before),
+            without_heap_addresses(&after)
+        );
     }
 }

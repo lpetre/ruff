@@ -158,7 +158,7 @@ pub(crate) fn infer_definition_types<'db>(
         InferenceRegion::Definition(definition),
         python_file.file(db),
         program_file,
-        index,
+        &index,
         &module,
     )
     .finish_definition(definition)
@@ -213,7 +213,7 @@ pub(crate) fn function_known_decorators<'db>(
         InferenceRegion::FunctionDecorators(definition),
         python_file.file(db),
         program_file,
-        index,
+        &index,
         &module,
     )
     .finish_function_decorator_inference()
@@ -311,7 +311,7 @@ pub(crate) fn infer_deferred_types<'db>(
         InferenceRegion::Deferred(definition),
         python_file.file(db),
         program_file,
-        index,
+        &index,
         &module,
     )
     .finish_definition(definition)
@@ -348,7 +348,7 @@ pub(crate) fn infer_function_default_types<'db>(
         InferenceRegion::FunctionDefaults(definition),
         python_file.file(db),
         program_file,
-        index,
+        &index,
         &module,
     )
     .finish_definition(definition)
@@ -430,7 +430,7 @@ pub(crate) fn infer_scope_types_impl<'db>(
         InferenceRegion::Scope(scope, tcx),
         python_file.file(db),
         program_file,
-        index,
+        &index,
         &module,
     )
     .finish_scope()
@@ -485,7 +485,7 @@ pub(super) fn infer_expression_types_impl<'db>(
         InferenceRegion::Expression(expression, tcx),
         python_file.file(db),
         program_file,
-        index,
+        &index,
         &module,
     )
     .finish_expression()
@@ -606,7 +606,7 @@ fn infer_statement_types_impl<'db>(
         InferenceRegion::Statement(statement),
         python_file.file(db),
         program_file,
-        index,
+        &index,
         &module,
     )
     .finish_statement()
@@ -1468,7 +1468,7 @@ impl<'db> DefinitionInference<'db> {
                     InferenceRegion::Definition(definition),
                     python_file.file(db),
                     program_file,
-                    index,
+                    &index,
                     &module,
                 )
                 .infer_annotated_assignment_cycle_initial(

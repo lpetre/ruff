@@ -479,7 +479,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         // Determine the expected binding context from the current type parameter scope.
         // Only check function and type alias scopes; class scopes are handled separately
         // when processing the class definition.
-        let expected_binding_def = match self.scope().node(db) {
+        let scope_node = self.scope().node(db);
+        let expected_binding_def = match &scope_node {
             NodeWithScopeKind::FunctionTypeParameters(function) => {
                 self.index.expect_single_definition(function)
             }

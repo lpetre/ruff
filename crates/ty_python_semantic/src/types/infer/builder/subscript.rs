@@ -2451,7 +2451,7 @@ impl<'db> LegacyGenericContextError<'db> {
 fn infer_legacy_generic_subscript<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
-    index: &'db SemanticIndex<'db>,
+    index: &SemanticIndex<'db>,
     file_scope_id: FileScopeId,
     typevar_binding_context: Option<Definition<'db>>,
     slice_ty: Type<'db>,
@@ -2501,7 +2501,7 @@ fn infer_legacy_generic_subscript<'db>(
 fn legacy_generic_class_context<'db>(
     db: &'db dyn Db,
     env: &ProgramEnvironment<'db>,
-    index: &'db SemanticIndex<'db>,
+    index: &SemanticIndex<'db>,
     file_scope_id: FileScopeId,
     typevar_binding_context: Option<Definition<'db>>,
     typevars: Type<'db>,

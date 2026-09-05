@@ -816,7 +816,7 @@ impl<'db> TypeVarInstance<'db> {
         let (_, child) = index
             .child_scopes(typevar_definition.file_scope(db))
             .next()?;
-        GenericContext::of_node(db, child.node(), index)?.binds_typevar(db, self)
+        GenericContext::of_node(db, child.node(), &index)?.binds_typevar(db, self)
     }
 }
 

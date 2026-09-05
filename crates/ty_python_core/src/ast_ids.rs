@@ -55,8 +55,8 @@ impl AstIds {
     }
 }
 
-fn ast_ids<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> &'db AstIds {
-    semantic_index(db, file).ast_ids()
+fn use_id(db: &dyn Db, file: ProgramFile<'_>, key: impl Into<ExpressionNodeKey>) -> ScopedUseId {
+    semantic_index(db, file).ast_ids().use_id(key)
 }
 
 /// Uniquely identifies a use of a name in a [`crate::FileScopeId`].
@@ -71,8 +71,7 @@ pub trait HasScopedUseId {
 
 impl HasScopedUseId for ast::Identifier {
     fn scoped_use_id(&self, db: &dyn Db, file: ProgramFile<'_>) -> ScopedUseId {
-        let ast_ids = ast_ids(db, file);
-        ast_ids.use_id(self)
+        use_id(db, file, self)
     }
 }
 
@@ -99,15 +98,13 @@ impl HasScopedUseId for ast::ExprSubscript {
 
 impl HasScopedUseId for ast::Keyword {
     fn scoped_use_id(&self, db: &dyn Db, file: ProgramFile<'_>) -> ScopedUseId {
-        let ast_ids = ast_ids(db, file);
-        ast_ids.use_id(self)
+        use_id(db, file, self)
     }
 }
 
 impl HasScopedUseId for ast::ExprRef<'_> {
     fn scoped_use_id(&self, db: &dyn Db, file: ProgramFile<'_>) -> ScopedUseId {
-        let ast_ids = ast_ids(db, file);
-        ast_ids.use_id(*self)
+        use_id(db, file, *self)
     }
 }
 

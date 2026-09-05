@@ -546,7 +546,7 @@ pub(super) fn user_visible_definitions<'db>(
             DefinitionKind::NestedBindings(nested) => {
                 let index = semantic_index(db, definition.program_file(db));
                 let sources = nested
-                    .visible_binding_sources(index, definition.file_scope(db))
+                    .visible_binding_sources(&index, definition.file_scope(db))
                     .flatten()
                     .filter_map(|binding| binding.binding.definition());
                 // A lazy function proxy can lead to an eager comprehension proxy. Follow that

@@ -266,7 +266,7 @@ const NUM_FIELD_SPECIFIERS_INLINE: usize = 1;
 pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     context: InferContext<'db, 'ast>,
 
-    index: &'db SemanticIndex<'db>,
+    index: &'ast SemanticIndex<'db>,
     region: InferenceRegion<'db>,
 
     /// The types of every expression in this region.
@@ -491,7 +491,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         region: InferenceRegion<'db>,
         file: File,
         program_file: ProgramFile<'db>,
-        index: &'db SemanticIndex<'db>,
+        index: &'ast SemanticIndex<'db>,
         module: &'ast ParsedModuleRef,
     ) -> Self {
         let scope = region.scope(db);
@@ -901,7 +901,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn setup_dataclass_field_specifiers(&mut self) {
         fn field_specifiers<'db>(
             db: &'db dyn Db,
-            index: &'db SemanticIndex<'db>,
+            index: &SemanticIndex<'db>,
             scope: ScopeId<'db>,
         ) -> Option<SmallVec<[Type<'db>; NUM_FIELD_SPECIFIERS_INLINE]>> {
             let enclosing_scope = index.scope(scope.file_scope_id(db));
@@ -10405,7 +10405,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     fn infer_place_load_source(
         &self,
         place_expr: PlaceExprRef,
-        source: PlaceLoadSource<'db>,
+        source: PlaceLoadSource<'db, 'ast>,
         narrowing_constraints: &[(FileScopeId, ConstraintKey)],
     ) -> PlaceAndQualifiers<'db> {
         let db = self.db();

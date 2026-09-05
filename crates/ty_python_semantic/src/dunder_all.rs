@@ -7,7 +7,7 @@ use ty_module_resolver::{ImportingFile, resolve_module_for_import_from};
 
 use crate::types::{Type, TypeContext, infer_expression_types};
 use crate::{Db, ProgramEnvironment};
-use ty_python_core::{ProgramFile, SemanticIndex, Truthiness, semantic_index};
+use ty_python_core::{ProgramFile, SemanticIndexRef, Truthiness, semantic_index};
 
 /// Returns a set of names in the `__all__` variable for `file`, [`None`] if it is not defined or
 /// if it contains invalid elements.
@@ -30,7 +30,7 @@ struct DunderAllNamesCollector<'db> {
     file: ProgramFile<'db>,
 
     /// The semantic index for the module.
-    index: &'db SemanticIndex<'db>,
+    index: SemanticIndexRef<'db>,
 
     /// The origin of the `__all__` variable in the current module, [`None`] if it is not defined.
     origin: Option<DunderAllOrigin>,
@@ -44,7 +44,7 @@ struct DunderAllNamesCollector<'db> {
 }
 
 impl<'db> DunderAllNamesCollector<'db> {
-    fn new(db: &'db dyn Db, file: ProgramFile<'db>, index: &'db SemanticIndex<'db>) -> Self {
+    fn new(db: &'db dyn Db, file: ProgramFile<'db>, index: SemanticIndexRef<'db>) -> Self {
         Self {
             db,
             env: ProgramEnvironment::from_file(file),

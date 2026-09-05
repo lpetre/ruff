@@ -970,13 +970,13 @@ impl<'db> UseDefMap<'db> {
             .flatten()
     }
 
-    pub fn applicable_constraints(
-        &self,
+    pub fn applicable_constraints<'map>(
+        &'map self,
         constraint_key: ConstraintKey,
         enclosing_scope: FileScopeId,
         expr: PlaceExprRef,
-        index: &'db SemanticIndex,
-    ) -> ApplicableConstraints<'_, 'db> {
+        index: &'map SemanticIndex<'db>,
+    ) -> ApplicableConstraints<'map, 'db> {
         match constraint_key {
             ConstraintKey::NarrowingConstraint(constraint) => {
                 ApplicableConstraints::UnboundBinding(NarrowingEvaluator {

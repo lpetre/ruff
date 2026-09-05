@@ -153,7 +153,7 @@ pub fn fixture_bindings_for_parameter<'db>(
         let file = parameter.program_file(db);
         let index = semantic_index(db, file);
         for class_ref in std::iter::successors(Some(class_scope), |scope| {
-            non_type_parameter_parent(index, *scope)
+            non_type_parameter_parent(&index, *scope)
         })
         .map_while(|scope| index.scope(scope).node().as_class())
         {
@@ -288,7 +288,7 @@ pub fn fixture_exposures_for_definition<'db>(
 ) -> Vec<FixtureExposure<'db>> {
     let index = semantic_index(db, definition.program_file(db));
     let definition_scope = definition.file_scope(db);
-    if !is_available_fixture_search_scope(db, index, definition_scope)
+    if !is_available_fixture_search_scope(db, &index, definition_scope)
         || !is_available_definition(db, definition)
     {
         return Vec::new();
@@ -417,7 +417,7 @@ struct FixtureRequestContext<'db, 'ast> {
     function_type: FunctionType<'db>,
     function: &'ast ast::StmtFunctionDef,
     module: &'ast ParsedModuleRef,
-    index: &'db ty_python_core::SemanticIndex<'db>,
+    index: &'ast ty_python_core::SemanticIndex<'db>,
     class_scope: Option<FileScopeId>,
     is_fixture_dependency: bool,
     mock_patch_count: usize,
@@ -428,10 +428,10 @@ impl<'db, 'ast> FixtureRequestContext<'db, 'ast> {
     /// through one or more parameters.
     fn new(
         db: &'db dyn Db,
-        function_ref: &'db AstNodeRef<ast::StmtFunctionDef>,
+        function_ref: &'ast AstNodeRef<ast::StmtFunctionDef>,
         class_scope: Option<FileScopeId>,
         module: &'ast ParsedModuleRef,
-        index: &'db ty_python_core::SemanticIndex<'db>,
+        index: &'ast ty_python_core::SemanticIndex<'db>,
     ) -> Option<Self> {
         let function_definition = index.expect_single_definition(function_ref);
         let function = function_ref.node(module);
@@ -633,9 +633,9 @@ fn fixture_request_for_parameter<'db>(
     let index = semantic_index(db, file);
     let function_scope = definition.scope(db).file_scope_id(db);
     let function_ref = index.scope(function_scope).node().as_function()?;
-    let class_scope = FixtureRequestContext::parent_scope(index, function_scope)?.class_scope();
+    let class_scope = FixtureRequestContext::parent_scope(&index, function_scope)?.class_scope();
     let module = parsed_module(db, file.python_file(db)).load(db);
-    let context = FixtureRequestContext::new(db, function_ref, class_scope, &module, index)?;
+    let context = FixtureRequestContext::new(db, function_ref, class_scope, &module, &index)?;
 
     context.fixture_request_for_parameter(db, definition)
 }
