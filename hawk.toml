@@ -100,6 +100,14 @@ kind = "constant"
 level = "expect"
 reason = "public cursor documentation links to this end-of-file sentinel"
 
+[[override]]
+lint = "hawk::unnecessary_public"
+crate = "ty_python_core"
+item = "SemanticIndexHandle::<'db>::clear"
+kind = "inherent_method"
+level = "expect"
+reason = "the out-of-tree dead-cst runtime releases per-file semantic indices after extracting them"
+
 # Keep APIs referenced by public documentation or paired with sibling APIs.
 
 [[override]]

@@ -99,7 +99,7 @@ use crate::Db;
 /// Returns an iterator over the steps that resolve a value for a place load.
 pub(crate) fn resolve_place_load<'db, 'ast>(
     db: &'db dyn Db,
-    index: &'db SemanticIndex<'db>,
+    index: &'ast SemanticIndex<'db>,
     scope: ScopeId<'db>,
     place_expr: PlaceExpr,
     mode: PlaceLoadMode<'ast>,
@@ -152,15 +152,15 @@ pub(crate) struct PlaceLoadResolution<'db, 'ast> {
     /// Read-only context shared by every source-selection phase.
     context: PlaceLoadResolutionContext<'db, 'ast>,
     /// The next node to visit in the resolution graph, or `None` after reaching a leaf.
-    next_node: Option<PlaceLoadResolutionNode<'db>>,
+    next_node: Option<PlaceLoadResolutionNode<'db, 'ast>>,
     /// Narrowing constraints accumulated while resolution advances.
     constraints: PlaceLoadConstraints,
     /// Whether resolution has crossed a `global` or `nonlocal` declaration so far.
     crosses_scope_declaration: bool,
 }
 
-impl<'db> Iterator for PlaceLoadResolution<'db, '_> {
-    type Item = PlaceLoadResolutionStep<'db>;
+impl<'db, 'ast> Iterator for PlaceLoadResolution<'db, 'ast> {
+    type Item = PlaceLoadResolutionStep<'db, 'ast>;
 
     /// Lazily yields [`PlaceLoadResolutionStep`] values to describe the resolution process.
     ///
@@ -339,7 +339,7 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
         }
     }
 
-    fn decide_resolution_path(&mut self) -> PlaceLoadResolutionNode<'db> {
+    fn decide_resolution_path(&mut self) -> PlaceLoadResolutionNode<'db, 'ast> {
         let db = self.context.db;
         let scope = self.context.scope;
         let file_scope = scope.file_scope_id(db);
@@ -392,8 +392,11 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
 
     fn resolve_enclosing_scopes(
         &mut self,
-        scopes: &mut AncestorsIter<'db>,
-    ) -> (PlaceLoadResolutionNode<'db>, Option<PlaceLoadSource<'db>>) {
+        scopes: &mut AncestorsIter<'ast>,
+    ) -> (
+        PlaceLoadResolutionNode<'db, 'ast>,
+        Option<PlaceLoadSource<'db, 'ast>>,
+    ) {
         let db = self.context.db;
         let scope = self.context.scope;
         let file_scope = scope.file_scope_id(db);
@@ -532,7 +535,7 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
     ///
     /// An eager nested scope uses the global snapshot captured when it began, so a class body
     /// cannot see a module binding created only after that body finishes.
-    fn resolve_global(&mut self, role: PlaceLoadSourceRole) -> Option<PlaceLoadSource<'db>> {
+    fn resolve_global(&mut self, role: PlaceLoadSourceRole) -> Option<PlaceLoadSource<'db, 'ast>> {
         let current_scope = self.context.scope.file_scope_id(self.context.db);
         if current_scope.is_global() {
             return None;
@@ -577,7 +580,7 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
         ))
     }
 
-    fn node_after_enclosing_scope(kind: ScopeKind) -> PlaceLoadResolutionNode<'db> {
+    fn node_after_enclosing_scope(kind: ScopeKind) -> PlaceLoadResolutionNode<'db, 'ast> {
         if kind.is_class() {
             PlaceLoadResolutionNode::ImplicitGlobalSource
         } else {
@@ -587,7 +590,7 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
 
     pub(crate) fn narrowing_constraints_for(
         &self,
-        source: &PlaceLoadSource<'_>,
+        source: &PlaceLoadSource<'_, '_>,
     ) -> &[(FileScopeId, ConstraintKey)] {
         self.constraints.narrowing_constraints_for(source)
     }
@@ -608,9 +611,9 @@ impl<'db, 'ast> PlaceLoadResolution<'db, 'ast> {
     }
 }
 
-pub(crate) enum PlaceLoadResolutionStep<'db> {
+pub(crate) enum PlaceLoadResolutionStep<'db, 'ast> {
     // A source that can supply the value for a load.
-    Source(PlaceLoadSource<'db>),
+    Source(PlaceLoadSource<'db, 'ast>),
     // A condition that the caller must evaluate to determine whether resolution should continue
     // for a member load.
     MemberResolutionCondition(PlaceExprPrefixLoads<'db>),
@@ -677,16 +680,16 @@ pub(crate) enum PlaceLoadResolutionStep<'db> {
 /// that source is undefined and the consumer requests the next source, the
 /// `UseId` key narrows the enclosing `int | None` place to `int`. If both
 /// sources are exhausted, the key remains active for expression-level narrowing.
-pub(crate) struct PlaceLoadSource<'db> {
+pub(crate) struct PlaceLoadSource<'db, 'ast> {
     /// How this source supplies the loaded value.
-    pub(crate) kind: PlaceLoadSourceKind<'db>,
+    pub(crate) kind: PlaceLoadSourceKind<'db, 'ast>,
     /// Selects the constraints used to narrow this source.
     entry_checkpoint: usize,
     /// The role this source plays in the load.
     role: PlaceLoadSourceRole,
 }
 
-impl PlaceLoadSource<'_> {
+impl PlaceLoadSource<'_, '_> {
     /// Returns whether this source is the module fallback for a class-local name.
     pub(crate) fn is_class_body_global_fallback(&self) -> bool {
         self.role == PlaceLoadSourceRole::ClassBodyGlobalFallback
@@ -704,7 +707,7 @@ impl PlaceLoadSource<'_> {
 }
 
 /// Describes how a source can supply a place's value.
-pub(crate) enum PlaceLoadSourceKind<'db> {
+pub(crate) enum PlaceLoadSourceKind<'db, 'ast> {
     /// Bindings already selected for this load state.
     ///
     /// For an ordinary expression, these are the bindings that reach that point:
@@ -717,7 +720,7 @@ pub(crate) enum PlaceLoadSourceKind<'db> {
     ///
     /// An enclosing eager snapshot is likewise a point-in-time view. A deferred load instead
     /// selects all bindings reachable in its scope.
-    Bindings(BindingWithConstraintsIterator<'db, 'db>),
+    Bindings(BindingWithConstraintsIterator<'ast, 'db>),
     /// The whole place in the scope that owns it.
     ///
     /// A free-variable load in a lazy nested scope can observe any definition reachable for the
@@ -872,13 +875,13 @@ pub(crate) enum PlaceExprPrefixLoad {
 #[derive(Clone, Copy)]
 struct PlaceLoadResolutionContext<'db, 'ast> {
     db: &'db dyn Db,
-    index: &'db SemanticIndex<'db>,
+    index: &'ast SemanticIndex<'db>,
     scope: ScopeId<'db>,
     file: ProgramFile<'db>,
     mode: PlaceLoadMode<'ast>,
 }
 
-impl<'db> PlaceLoadResolutionContext<'db, '_> {
+impl<'db, 'ast> PlaceLoadResolutionContext<'db, 'ast> {
     fn symbol_has_scope_declaration(self, place_expr: PlaceExprRef) -> bool {
         let Some(symbol) = place_expr.as_symbol() else {
             return false;
@@ -910,7 +913,7 @@ impl<'db> PlaceLoadResolutionContext<'db, '_> {
         self,
         place_expr: PlaceExprRef,
     ) -> Option<(
-        PlaceLoadSourceKind<'db>,
+        PlaceLoadSourceKind<'db, 'ast>,
         Option<(FileScopeId, ConstraintKey)>,
     )> {
         let scope = self.scope.file_scope_id(self.db);
@@ -1027,7 +1030,7 @@ impl<'db> PlaceLoadResolutionContext<'db, '_> {
 /// either ask the consumer whether traversal should continue or decide which outgoing edge to
 /// follow. Every transition advances toward a [`PlaceLoadResolutionNode::Failure`] leaf; no node
 /// is revisited.
-enum PlaceLoadResolutionNode<'db> {
+enum PlaceLoadResolutionNode<'db, 'ast> {
     /// The source selected from the load's own scope, if one exists.
     LocalSource,
     /// Ask the consumer whether resolution should continue for a member load.
@@ -1038,15 +1041,15 @@ enum PlaceLoadResolutionNode<'db> {
     /// The implicit `__class__` source, followed by enclosing scopes.
     DunderClassSource {
         definition: Definition<'db>,
-        enclosing_scopes: AncestorsIter<'db>,
+        enclosing_scopes: AncestorsIter<'ast>,
     },
     /// A source from the remaining enclosing scopes, if one exists.
-    EnclosingScopeSource(AncestorsIter<'db>),
+    EnclosingScopeSource(AncestorsIter<'ast>),
     /// The implicit class-body source, followed by the applicable global source.
-    ImplicitClassBodySource(Option<ForwardedGlobalSnapshot<'db>>),
+    ImplicitClassBodySource(Option<ForwardedGlobalSnapshot<'db, 'ast>>),
     /// Bindings from an enclosing `global` declaration that were visible when the nested eager
     /// scope began.
-    ForwardedGlobalSnapshotSource(ForwardedGlobalSnapshot<'db>),
+    ForwardedGlobalSnapshotSource(ForwardedGlobalSnapshot<'db, 'ast>),
     /// An explicit global source with the given role, if one exists.
     ExplicitGlobalSource(PlaceLoadSourceRole),
     /// An implicit global considered after explicit lookup, if one exists.
@@ -1057,8 +1060,8 @@ enum PlaceLoadResolutionNode<'db> {
     Failure(PlaceLoadFailure),
 }
 
-struct ForwardedGlobalSnapshot<'db> {
-    bindings: BindingWithConstraintsIterator<'db, 'db>,
+struct ForwardedGlobalSnapshot<'db, 'ast> {
+    bindings: BindingWithConstraintsIterator<'ast, 'db>,
     enclosing_scope: FileScopeId,
 }
 
@@ -1087,12 +1090,12 @@ impl PlaceLoadConstraints {
     /// The local source is selected by `bindings_at_use(U)`. Its `UseId(U)` is the exit constraint:
     /// it is not applied again to that source, but becomes active if the source is unbound so that
     /// the enclosing `outer.value` source is narrowed from `int | None` to `int`.
-    fn source<'db>(
+    fn source<'db, 'ast>(
         &mut self,
-        kind: PlaceLoadSourceKind<'db>,
+        kind: PlaceLoadSourceKind<'db, 'ast>,
         role: PlaceLoadSourceRole,
         exit_constraint: Option<(FileScopeId, ConstraintKey)>,
-    ) -> PlaceLoadSource<'db> {
+    ) -> PlaceLoadSource<'db, 'ast> {
         let entry_checkpoint = self.constraint_keys.len();
         self.constraint_keys.extend(exit_constraint);
         PlaceLoadSource {
@@ -1103,10 +1106,10 @@ impl PlaceLoadConstraints {
     }
 
     /// Creates a source without applying accumulated narrowing constraints to it.
-    fn unnarrowed_source(
-        kind: PlaceLoadSourceKind<'_>,
+    fn unnarrowed_source<'db, 'ast>(
+        kind: PlaceLoadSourceKind<'db, 'ast>,
         role: PlaceLoadSourceRole,
-    ) -> PlaceLoadSource<'_> {
+    ) -> PlaceLoadSource<'db, 'ast> {
         PlaceLoadSource {
             kind,
             entry_checkpoint: 0,
@@ -1122,7 +1125,7 @@ impl PlaceLoadConstraints {
     /// Returns the constraints used to narrow `source`.
     fn narrowing_constraints_for(
         &self,
-        source: &PlaceLoadSource<'_>,
+        source: &PlaceLoadSource<'_, '_>,
     ) -> &[(FileScopeId, ConstraintKey)] {
         &self.constraint_keys[..source.entry_checkpoint]
     }

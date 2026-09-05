@@ -306,7 +306,8 @@ impl<'db> ImplementationsFinder<'db> {
             .inferred_type(model)
             .and_then(Type::as_property_instance)
             .and_then(|property| property.accessor_role(db, function_definition));
-        let class_node = containing_scope.node(db).as_class()?;
+        let class_scope_node = containing_scope.node(db);
+        let class_node = class_scope_node.as_class()?;
         let class_definition = semantic_index(db, containing_scope.program_file(db))
             .expect_single_definition(class_node);
         let class_ty = binding_type(db, class_definition);
@@ -779,7 +780,7 @@ fn is_reachable_implementation_definition<'db>(
     let parsed = parsed_module(db, file.python_file(db)).load(db);
     is_range_reachable(
         db,
-        semantic_index(db, file),
+        &semantic_index(db, file),
         definition.file_scope(db),
         definition.full_range(db, &parsed).range(),
     )
@@ -2040,7 +2041,7 @@ fn reachable_class_literals_in_file<'db>(
 
         // Drop classes in dead code — e.g. a class under if sys.version_info < (3, 9): on a newer Python.
         let file_scope_id = scope_id.file_scope_id(db);
-        if !is_range_reachable(db, index, file_scope_id, class_node.node(&parsed).range()) {
+        if !is_range_reachable(db, &index, file_scope_id, class_node.node(&parsed).range()) {
             continue;
         }
 

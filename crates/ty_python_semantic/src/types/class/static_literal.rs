@@ -404,7 +404,7 @@ impl<'db> StaticClassLiteral<'db> {
         class_def_node.type_params.as_ref().map(|type_params| {
             let index = semantic_index(db, program_file);
             let definition = index.expect_single_definition(class_def_node);
-            GenericContext::from_type_params(db, index, definition, type_params)
+            GenericContext::from_type_params(db, &index, definition, type_params)
         })
     }
 

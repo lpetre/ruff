@@ -849,7 +849,7 @@ impl<'db> ErrorContextNode<'db> {
             && let Some(definition) = protocol_member.definition()
             && let Some(declaring_protocol) = nearest_enclosing_class(
                 db,
-                semantic_index(db, definition.program_file(db)),
+                &semantic_index(db, definition.program_file(db)),
                 definition.scope(db),
             )
         {

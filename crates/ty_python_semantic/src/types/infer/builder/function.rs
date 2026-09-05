@@ -1208,7 +1208,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         // Return early if this is not a method inside a class.
-        let class = parent_scope_id.scope(db).node().as_class()?;
+        let class_scope = parent_scope_id.scope(db);
+        let class = class_scope.node().as_class()?;
 
         let method_definition = self.index.expect_single_definition(function);
         let DefinitionKind::Function(function_definition) = method_definition.kind(db) else {

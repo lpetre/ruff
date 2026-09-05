@@ -5899,7 +5899,8 @@ fn parameter_default_type<'db>(db: &'db dyn Db, parameter: Definition<'db>) -> T
     else {
         return Type::unknown();
     };
-    let Some(function) = parameter.scope(db).node(db).as_function() else {
+    let scope_node = parameter.scope(db).node(db);
+    let Some(function) = scope_node.as_function() else {
         return Type::unknown();
     };
     let program_file = parameter.program_file(db);

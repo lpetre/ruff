@@ -445,11 +445,16 @@ impl<'db> SemanticModel<'db> {
     pub fn ancestor_scopes(
         &self,
         node: ast::AnyNodeRef<'_>,
-    ) -> impl Iterator<Item = (FileScopeId, &Scope)> + '_ {
+    ) -> impl Iterator<Item = (FileScopeId, Scope)> {
         let index = semantic_index(self.db, self.program_file());
-        self.scope(node)
+        // Collected eagerly: the returned iterator must not borrow the loaded index.
+        let scopes: Vec<_> = self
+            .scope(node)
             .into_iter()
-            .flat_map(move |scope| index.ancestor_scopes(scope))
+            .flat_map(|scope| index.ancestor_scopes(scope))
+            .map(|(scope_id, scope)| (scope_id, scope.clone()))
+            .collect();
+        scopes.into_iter()
     }
 
     /// Returns the first local definition created by `covering_node`, if any.

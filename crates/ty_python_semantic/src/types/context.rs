@@ -346,7 +346,7 @@ impl<'db, 'ast> InferContext<'db, 'ast> {
         let db = self.db;
         let index = semantic_index(self.db(), self.program_file);
         let scope_id = self.scope.file_scope_id(self.db());
-        is_range_reachable(db, index, scope_id, range)
+        is_range_reachable(db, &index, scope_id, range)
     }
 
     /// Are we currently inferring types in a stub file?

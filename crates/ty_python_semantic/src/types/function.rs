@@ -461,8 +461,8 @@ impl<'db> OverloadLiteral<'db> {
         // here to get the previous function definition with the same name.
         let scope = self.definition(db).scope(db);
         let module = parsed_module(db, self.python_file(db)).load(db);
-        let use_def =
-            semantic_index(db, scope.program_file(db)).use_def_map(scope.file_scope_id(db));
+        let index = semantic_index(db, scope.program_file(db));
+        let use_def = index.use_def_map(scope.file_scope_id(db));
         let use_id = self
             .body_scope(db)
             .node(db)
@@ -529,7 +529,7 @@ impl<'db> OverloadLiteral<'db> {
         let function_node = scope.node(db).expect_function().node(&module);
         let index = semantic_index(db, program_file);
         let file_scope_id = scope.file_scope_id(db);
-        let is_generator = file_scope_id.is_generator_function(index);
+        let is_generator = file_scope_id.is_generator_function(&index);
 
         if function_node.is_async && !is_generator {
             let env = ProgramEnvironment::from_file(program_file);
@@ -632,7 +632,7 @@ impl<'db> OverloadLiteral<'db> {
         let definition = self.definition(db);
         let index = semantic_index(db, program_file);
         let pep695_ctx = function_stmt_node.type_params.as_ref().map(|type_params| {
-            GenericContext::from_type_params(db, index, definition, type_params)
+            GenericContext::from_type_params(db, &index, definition, type_params)
         });
         let file_scope_id = scope.file_scope_id(db);
 
@@ -641,7 +641,7 @@ impl<'db> OverloadLiteral<'db> {
             self,
             function_stmt_node,
             file_scope_id,
-            index,
+            &index,
         );
 
         let mut raw_signature = Signature::from_function(
@@ -697,7 +697,7 @@ impl<'db> OverloadLiteral<'db> {
                 let scope_id = definition.scope(db);
                 let typevar_binding_context = Some(definition);
                 let index = semantic_index(db, scope_id.program_file(db));
-                let class = nearest_enclosing_class(db, index, scope_id).unwrap();
+                let class = nearest_enclosing_class(db, &index, scope_id).unwrap();
 
                 let typing_self = typing_self(db, scope_id, typevar_binding_context, class.into())
                     .expect(

@@ -129,7 +129,8 @@ pub(super) fn walk_pep_695_type_alias<'db, V: visitor::TypeVisitor<'db> + ?Sized
 impl<'db> PEP695TypeAliasType<'db> {
     fn definition(self, db: &'db dyn Db) -> Definition<'db> {
         let scope = self.rhs_scope(db);
-        let type_alias_stmt_node = scope.node(db).expect_type_alias();
+        let scope_node = scope.node(db);
+        let type_alias_stmt_node = scope_node.expect_type_alias();
         semantic_index(db, scope.program_file(db)).expect_single_definition(type_alias_stmt_node)
     }
 
@@ -160,7 +161,8 @@ impl<'db> PEP695TypeAliasType<'db> {
         let program_file = scope.program_file(db);
         let python_file = program_file.python_file(db);
         let module = parsed_module(db, python_file).load(db);
-        let type_alias_stmt_node = scope.node(db).expect_type_alias();
+        let scope_node = scope.node(db);
+        let type_alias_stmt_node = scope_node.expect_type_alias();
         let definition = self.definition(db);
 
         definition_expression_type(db, definition, &type_alias_stmt_node.node(&module).value)
@@ -198,7 +200,8 @@ impl<'db> PEP695TypeAliasType<'db> {
         let program_file = scope.program_file(db);
         let python_file = program_file.python_file(db);
         let parsed = parsed_module(db, python_file).load(db);
-        let type_alias_stmt_node = scope.node(db).expect_type_alias();
+        let scope_node = scope.node(db);
+        let type_alias_stmt_node = scope_node.expect_type_alias();
 
         type_alias_stmt_node
             .node(&parsed)
@@ -207,7 +210,7 @@ impl<'db> PEP695TypeAliasType<'db> {
             .map(|type_params| {
                 let index = semantic_index(db, program_file);
                 let definition = index.expect_single_definition(type_alias_stmt_node);
-                GenericContext::from_type_params(db, index, definition, type_params)
+                GenericContext::from_type_params(db, &index, definition, type_params)
             })
     }
 }
@@ -332,7 +335,7 @@ impl<'db> ManualPEP695TypeAliasType<'db> {
             let typevar = match definition_expression_type(db, definition, element) {
                 Type::KnownInstance(KnownInstanceType::TypeVar(typevar)) => bind_typevar(
                     db,
-                    index,
+                    &index,
                     definition.file_scope(db),
                     Some(definition),
                     typevar,

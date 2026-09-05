@@ -8104,7 +8104,7 @@ impl<'db> Type<'db> {
                     let index = semantic_index(db, scope_id.program_file(db));
                     Ok(bind_typevar(
                         db,
-                        index,
+                        &index,
                         scope_id.file_scope_id(db),
                         typevar_binding_context,
                         *typevar,
@@ -11218,7 +11218,12 @@ impl<'db> ModuleLiteralType<'db> {
     fn available_submodule_attributes(&self, db: &'db dyn Db) -> impl Iterator<Item = Name> {
         self.importing_file(db)
             .into_iter()
-            .flat_map(|file| semantic_index(db, file).imported_modules())
+            .flat_map(|file| {
+                semantic_index(db, file)
+                    .imported_modules()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
             .filter_map(|submodule_name| submodule_name.relative_to(self.module(db).name(db)))
             .filter_map(|relative_submodule| relative_submodule.components().next().map(Name::from))
     }

@@ -6,7 +6,7 @@ use ruff_python_ast::{self as ast, NodeIndex};
 
 use crate::{
     Db, Program, ProgramFile, SemanticIndex, ast_node_ref::AstNodeRef, definition::Definition,
-    node_key::NodeKey, semantic_index,
+    node_key::NodeKey, semantic_index, semantic_index_handle,
 };
 
 /// A cross-module identifier of a scope that can be used as a salsa query parameter.
@@ -39,8 +39,9 @@ impl<'db> ScopeId<'db> {
         self.node(db).scope_kind().is_annotation()
     }
 
-    pub fn node(self, db: &'db dyn Db) -> &'db NodeWithScopeKind {
-        self.scope(db).node()
+    /// Returns a copy of the node that introduces this scope; see [`ScopeId::scope`].
+    pub fn node(self, db: &'db dyn Db) -> NodeWithScopeKind {
+        self.scope(db).node().clone()
     }
 
     /// Returns `true` if this scope may require type context from its parent scope.
@@ -55,8 +56,12 @@ impl<'db> ScopeId<'db> {
         )
     }
 
-    pub fn scope(self, db: &'db dyn Db) -> &'db Scope {
-        semantic_index(db, self.program_file(db)).scope(self.file_scope_id(db))
+    /// Returns a copy of the [`Scope`]: the index it lives in may be released at any time, so no
+    /// reference into it can outlive a [`crate::SemanticIndexRef`].
+    pub fn scope(self, db: &'db dyn Db) -> Scope {
+        semantic_index(db, self.program_file(db))
+            .scope(self.file_scope_id(db))
+            .clone()
     }
 
     /// Returns the class definition for the enclosing class if this scope is a method body.
@@ -110,8 +115,7 @@ impl FileScopeId {
     }
 
     pub fn to_scope_id<'db>(self, db: &'db dyn Db, file: ProgramFile<'db>) -> ScopeId<'db> {
-        let index = semantic_index(db, file);
-        index.scope_ids_by_scope[self]
+        semantic_index_handle(db, file).scope_id(self)
     }
 
     pub fn is_generator_function(self, index: &SemanticIndex) -> bool {
@@ -123,7 +127,7 @@ impl FileScopeId {
     }
 }
 
-#[derive(Debug, get_size2::GetSize)]
+#[derive(Clone, Debug, get_size2::GetSize)]
 pub struct Scope {
     /// The parent scope, if any.
     parent: Option<FileScopeId>,

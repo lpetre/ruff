@@ -87,15 +87,15 @@ fn pytest_tests_in_file<'db>(db: &'db dyn Db, file: ProgramFile<'db>) -> Box<[Py
     let index = semantic_index(db, file);
     let module = parsed_module(db, file.python_file(db)).load(db);
     let mut tests = Vec::new();
-    for scope in index.scope_ids() {
-        let scope = scope.file_scope_id(db);
+    for scope_id in index.scope_ids() {
+        let scope = scope_id.file_scope_id(db);
         if !matches!(
             index.scope(scope).kind(),
             ScopeKind::Module | ScopeKind::Class
         ) {
             continue;
         }
-        for (symbol, bindings) in index.use_def_map(scope).all_end_of_scope_symbol_bindings() {
+        for (symbol, bindings) in use_def_map(db, scope_id).all_end_of_scope_symbol_bindings() {
             let name = index.place_table(scope).symbol(symbol).name();
             if !name.starts_with("test") && name != "runTest" {
                 continue;

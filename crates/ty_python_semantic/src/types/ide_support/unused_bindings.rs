@@ -135,7 +135,7 @@ pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding
                 crate::types::function::function_has_stub_body(function.node(&parsed))
             });
         let function_is_overload_declaration =
-            function_scope_is_overload_declaration(db, index, file_scope_id);
+            function_scope_is_overload_declaration(db, &index, file_scope_id);
         let place_table = index.place_table(file_scope_id);
         let use_def_map = index.use_def_map(file_scope_id);
         // Loop headers are synthesized before the loop body definitions they point to;
@@ -197,7 +197,7 @@ pub fn unused_bindings(db: &dyn Db, file: ProgramFile<'_>) -> Box<[UnusedBinding
             // Treat them as externally managed to avoid false positives here.
             let is_local_comprehension_named_expression = scope_kind == ScopeKind::Comprehension
                 && matches!(kind, DefinitionKind::NamedExpression(_))
-                && comprehension_named_expression_is_local(index, file_scope_id, name);
+                && comprehension_named_expression_is_local(&index, file_scope_id, name);
             if (symbol.is_global() || symbol.is_nonlocal())
                 && !is_local_comprehension_named_expression
             {

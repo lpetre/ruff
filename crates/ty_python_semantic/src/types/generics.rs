@@ -328,7 +328,7 @@ pub(crate) fn typing_self<'db>(
 
     bind_typevar(
         db,
-        index,
+        &index,
         containing_scope,
         typevar_binding_context,
         typevar,

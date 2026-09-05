@@ -76,7 +76,7 @@ fn check_method_typevar_variance<'db>(
     }
 
     let index = semantic_index(db, body_scope.program_file(db));
-    let Some(class) = nearest_enclosing_class(db, index, body_scope) else {
+    let Some(class) = nearest_enclosing_class(db, &index, body_scope) else {
         return;
     };
     // Protocols require declared variance to match the inferred variance, including for explicitly

@@ -22,6 +22,7 @@ ty_vendored = { workspace = true }
 ty_site_packages = { workspace = true }
 ty_combine = { workspace = true }
 
+arc-swap = { workspace = true }
 bitflags = { workspace = true }
 bitvec = { workspace = true }
 char_str = { workspace = true, features = ["get-size"] }

@@ -34,7 +34,8 @@ use ty_python_core::definition::docstring_from_body;
 use ty_python_core::platform::PythonPlatform;
 use ty_python_core::scope::ScopeId;
 use ty_python_core::{
-    BindingWithConstraints, DeclarationsIterator, FileScopeId, attribute_scopes, semantic_index,
+    BindingWithConstraints, DeclarationsIterator, FileScopeId, attribute_scopes, place_table,
+    use_def_map,
 };
 pub use ty_site_packages::{
     PythonEnvironment, PythonVersionFileSource, PythonVersionSource, PythonVersionWithSource,
@@ -149,12 +150,13 @@ pub(crate) fn attribute_assignments<'db, 's>(
         FileScopeId,
     ),
 > + use<'s, 'db> {
-    let index = semantic_index(db, class_body_scope.program_file(db));
+    let program_file = class_body_scope.program_file(db);
 
     attribute_scopes(db, class_body_scope).filter_map(move |function_scope_id| {
-        let place_table = index.place_table(function_scope_id);
+        let scope = function_scope_id.to_scope_id(db, program_file);
+        let place_table = place_table(db, scope);
         let member = place_table.member_id_by_instance_attribute_name(name)?;
-        let use_def = index.use_def_map(function_scope_id);
+        let use_def = use_def_map(db, scope);
         let assignments = use_def
             .reachable_member_bindings(member)
             .filter(move |binding| {
@@ -176,12 +178,13 @@ pub(crate) fn attribute_declarations<'db, 's>(
     class_body_scope: ScopeId<'db>,
     name: &'s str,
 ) -> impl Iterator<Item = (DeclarationsIterator<'db, 'db>, FileScopeId)> + use<'s, 'db> {
-    let index = semantic_index(db, class_body_scope.program_file(db));
+    let program_file = class_body_scope.program_file(db);
 
-    attribute_scopes(db, class_body_scope).filter_map(|function_scope_id| {
-        let place_table = index.place_table(function_scope_id);
+    attribute_scopes(db, class_body_scope).filter_map(move |function_scope_id| {
+        let scope = function_scope_id.to_scope_id(db, program_file);
+        let place_table = place_table(db, scope);
         let member = place_table.member_id_by_instance_attribute_name(name)?;
-        let use_def = index.use_def_map(function_scope_id);
+        let use_def = use_def_map(db, scope);
         Some((
             use_def.reachable_member_declarations(member),
             function_scope_id,
